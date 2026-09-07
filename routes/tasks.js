@@ -8,22 +8,65 @@ const { optimizarCortes } = require('../utils/cableOptimizer');
 const router = express.Router();
 router.use(verifyToken);
 
-// Lista de tareas: el empleado solo ve las suyas; admin y dom ven todas
+// Lista de tareas: el empleado solo ve las suyas (hasta las 9pm si están terminadas); admin y dom ven activas
 router.get('/', async (req, res) => {
-  const filtro = req.user.rol === 'empleado' ? { asignadoA: req.user.id } : {};
+  let filtro = {};
+  if (req.user.rol === 'empleado') {
+    const now = new Date();
+    const currentHour = now.getHours();
+    let cutoff = new Date(now);
+    cutoff.setHours(21, 0, 0, 0);
+    if (currentHour < 21) {
+      cutoff.setDate(cutoff.getDate() - 1);
+    }
+
+    filtro = {
+      asignadoA: req.user.id,
+      $or: [
+        { estado: { $ne: 'revisada' } },
+        { estado: 'revisada', completedAt: { $gt: cutoff } }
+      ]
+    };
+  } else {
+    // Admin/Dom: Ocultar las tareas cerradas de la vista principal
+    filtro = { estado: { $ne: 'revisada' } };
+  }
+
   const tareas = await Task.find(filtro)
-    .select('-fotosReferencia -tiradas -bobinas') // Excluir datos pesados en la lista general
+    .select('-fotosReferencia -tiradas -bobinas')
     .populate('asignadoA', 'nombre')
     .sort({ createdAt: -1 });
   res.json(tareas);
 });
 
+// Tareas cerradas (solo para admin/dom)
+router.get('/historical', async (req, res) => {
+  if (req.user.rol === 'empleado') return res.status(403).json({ error: 'Prohibido' });
+  const tareas = await Task.find({ estado: 'revisada' })
+    .select('titulo completedAt')
+    .sort({ completedAt: -1 });
+  res.json(tareas);
+});
+
 router.get('/:id', async (req, res) => {
   const tarea = await Task.findById(req.params.id)
+    .select('-fotosReferencia') // Excluir base64 pesada
     .populate('asignadoA', 'nombre')
-    .populate('bobinas');
+    .populate('bobinas')
+    .lean();
+  
   if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
+  
+  // Saber si tiene fotos de referencia para mostrar el boton
+  const tareaCompleta = await Task.findById(req.params.id).select('fotosReferencia');
+  tarea.tieneFotos = tareaCompleta.fotosReferencia && tareaCompleta.fotosReferencia.length > 0;
+  
   res.json(tarea);
+});
+
+router.get('/:id/images', async (req, res) => {
+  const tarea = await Task.findById(req.params.id).select('fotosReferencia');
+  res.json(tarea ? tarea.fotosReferencia || [] : []);
 });
 
 // El instalador sube un comentario de avance (con fotos opcionales)
@@ -49,12 +92,26 @@ router.post('/:id/reports', async (req, res) => {
   res.status(201).json(report);
 });
 
-// Historico de avances de una tarea (lo usan empleado, admin y dom)
+// Historico de avances de una tarea (sin imagenes pesadas)
 router.get('/:id/reports', async (req, res) => {
   const reports = await Report.find({ tarea: req.params.id })
+    .select('-fotos')
     .populate('autor', 'nombre rol')
-    .sort({ createdAt: 1 });
+    .sort({ createdAt: 1 })
+    .lean();
+
+  // Añadir flag tieneFotos consultando la base
+  for (let r of reports) {
+    const repObj = await Report.findById(r._id).select('fotos');
+    r.tieneFotos = repObj.fotos && repObj.fotos.length > 0;
+  }
+
   res.json(reports);
+});
+
+router.get('/:id/reports/:reportId/images', async (req, res) => {
+  const report = await Report.findById(req.params.reportId).select('fotos');
+  res.json(report ? report.fotos || [] : []);
 });
 
 // Admin o dom cambian el estado de la tarea (ej: marcar como revisada)
