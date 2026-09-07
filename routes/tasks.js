@@ -4,6 +4,8 @@ const Bobina = require('../models/Bobina');
 const Report = require('../models/Report');
 const { verifyToken } = require('../middleware/auth');
 const { optimizarCortes } = require('../utils/cableOptimizer');
+const { sendPushNotification } = require('./push');
+const User = require('../models/User'); // Need User to find admins
 
 const router = express.Router();
 router.use(verifyToken);
@@ -80,7 +82,7 @@ router.post('/:id/reports', async (req, res) => {
   });
   
   const tarea = await Task.findById(req.params.id);
-  const updateFields = { estado: 'en_progreso' };
+  const updateFields = { estado: 'enviada' };
   if (tarea && !tarea.startedAt) {
     updateFields.startedAt = new Date();
   }
@@ -88,6 +90,20 @@ router.post('/:id/reports', async (req, res) => {
   
   const io = req.app.get('io');
   if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'nuevo_reporte' });
+
+  // Notificar a admins/dom
+  try {
+    const admins = await User.find({ rol: { $in: ['admin', 'socio'] } }); // socio == dom in naisata_db
+    for (const admin of admins) {
+      sendPushNotification(admin._id, {
+        title: 'Nuevo Reporte',
+        body: `El técnico ha subido un nuevo reporte en la tarea: ${tarea.titulo || ''}`,
+        url: `/?id=${req.params.id}`
+      });
+    }
+  } catch(e) {
+    console.error('Error enviando push de reporte:', e);
+  }
 
   res.status(201).json(report);
 });
@@ -128,6 +144,18 @@ router.patch('/:id/status', async (req, res) => {
   
   const io = req.app.get('io');
   if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'cambio_estado', estado });
+
+  if (tarea.asignadoA) {
+    let msgBody = `El estado de tu tarea cambió a ${estado}.`;
+    if (estado === 'revisada') msgBody = 'Tu tarea ha sido aprobada (Visto Bueno).';
+    if (estado === 'requiere_evidencia') msgBody = 'El administrador solicita más evidencia.';
+
+    sendPushNotification(tarea.asignadoA, {
+      title: 'Actualización de Tarea',
+      body: msgBody,
+      url: `/?id=${tarea._id}`
+    });
+  }
 
   res.json(tarea);
 });

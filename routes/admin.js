@@ -5,6 +5,7 @@ const Task = require('../models/Task');
 const Bobina = require('../models/Bobina');
 const { adminOrApiKey } = require('../middleware/auth');
 const { optimizarCortes } = require('../utils/cableOptimizer');
+const { sendPushNotification } = require('./push');
 
 const router = express.Router();
 
@@ -70,6 +71,13 @@ router.post('/tasks', async (req, res) => {
 
     const io = req.app.get('io');
     if (io) io.emit('new_task', task);
+
+    // Mandar push al asignado
+    sendPushNotification(asignadoA, {
+      title: 'Nueva Tarea Asignada',
+      body: `Te han asignado la tarea: ${titulo}`,
+      url: `/?id=${task._id}`
+    });
 
     res.status(201).json(task);
   } catch (err) {

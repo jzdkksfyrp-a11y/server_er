@@ -53,6 +53,7 @@ app.use('/auth', authRoutes);
 app.use('/admin', adminRoutes);
 app.use('/tasks', taskRoutes);
 app.use('/inventory', inventoryRoutes);
+app.use('/push', require('./routes/push').router);
 
 // La ruta raiz ya la maneja express.static (index.html)
 // Esta ruta es solo para verificar que el API esta activo
