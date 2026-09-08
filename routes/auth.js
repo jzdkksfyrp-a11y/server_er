@@ -8,6 +8,24 @@ const router = express.Router();
 // Mapa de roles de naisata_db → roles internos de app-it
 const ROL_MAP = { admin: 'admin', socio: 'dom', user: 'empleado' };
 
+router.get('/users', async (req, res) => {
+  try {
+    const users = await User.find({}, 'correo username nombre activo estadoCuenta').sort({ nombre: 1 });
+    
+    // Filtrar solo los activos
+    const activeUsers = users.filter(u => typeof u.activo === 'boolean' ? u.activo : u.estadoCuenta === 'activa');
+    
+    const publicUsers = activeUsers.map(u => ({
+      loginId: u.correo || u.username,
+      nombre: u.nombre || u.correo || u.username
+    }));
+    
+    res.json(publicUsers);
+  } catch (err) {
+    res.status(500).json({ error: 'Error al obtener usuarios' });
+  }
+});
+
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body; // el frontend sigue mandando "username"
