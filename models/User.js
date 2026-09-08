@@ -13,6 +13,7 @@ const userSchema = new mongoose.Schema(
     rol:          { type: String },                  // 'admin' | 'socio' | 'user'
     estadoCuenta: { type: String, default: 'activa' }, // 'activa' | 'inactiva'
     activo:       { type: Boolean },                 // campo legacy
+    creadoPor:    { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { strict: false, timestamps: true }
 );

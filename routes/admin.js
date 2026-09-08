@@ -21,8 +21,8 @@ router.post('/users', async (req, res) => {
       return res.status(400).json({ error: 'Rol invalido' });
     }
     const hash = await bcrypt.hash(password, 10);
-    const user = await User.create({ username, password: hash, nombre, rol });
-    res.status(201).json({ id: user._id, username: user.username, nombre: user.nombre, rol: user.rol });
+    const user = await User.create({ username, password: hash, nombre, rol, creadoPor: req.user.id });
+    res.status(201).json({ id: user._id, username: user.username, nombre: user.nombre, rol: user.rol, creadoPor: user.creadoPor });
   } catch (err) {
     res.status(400).json({ error: 'No se pudo crear el usuario', detalle: err.message });
   }
@@ -30,7 +30,7 @@ router.post('/users', async (req, res) => {
 
 // Listar usuarios (para el selector de "asignar a" en crear tarea)
 router.get('/users', async (req, res) => {
-  const users = await User.find({}, '-password').sort({ nombre: 1 });
+  const users = await User.find({ $or: [{ creadoPor: req.user.id }, { _id: req.user.id }] }, '-password').sort({ nombre: 1 });
   res.json(users);
 });
 
