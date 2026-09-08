@@ -13,7 +13,9 @@ router.get('/', async (req, res) => {
     if (req.query.estado) {
       filtro.estado = req.query.estado;
     }
-    const bobinas = await Bobina.find(filtro).populate('tareaActual', 'titulo');
+    const bobinas = await Bobina.find(filtro)
+      .populate('tareaActual', 'titulo')
+      .populate('empleadoAsignado', 'nombre');
     res.json(bobinas);
   } catch (err) {
     res.status(500).json({ error: err.message });

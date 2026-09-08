@@ -45,7 +45,7 @@ router.get('/', async (req, res) => {
 router.get('/historical', async (req, res) => {
   if (req.user.rol === 'empleado') return res.status(403).json({ error: 'Prohibido' });
   const tareas = await Task.find({ estado: 'revisada' })
-    .select('titulo completedAt')
+    .select('titulo completedAt cotizacionFolio creadoPorEmpleado')
     .sort({ completedAt: -1 });
   res.json(tareas);
 });
@@ -329,6 +329,138 @@ router.post('/:id/finalize', async (req, res) => {
   if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'cambio_estado', estado: 'revisada' });
 
   res.json(tarea);
+});
+
+
+// ── NUEVO: Obtener bobinas asignadas al empleado logueado ────────────────────
+router.get('/mis-bobinas', async (req, res) => {
+  try {
+    const bobinas = await Bobina.find({ empleadoAsignado: req.user.id, estado: 'asignada', tareaActual: null });
+    res.json(bobinas);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── NUEVO: Empleado crea su propia tarea con bobinas que ya tiene asignadas ──
+// El empleado reporta qué hizo, dónde, qué tiradas cortó y sube evidencia
+router.post('/employee-quick-task', async (req, res) => {
+  // Solo empleados
+  if (req.user.rol !== 'empleado') {
+    return res.status(403).json({ error: 'Solo empleados pueden usar este endpoint' });
+  }
+  try {
+    const { titulo, descripcion, tiradas, bobinaIds, fotosReferencia } = req.body;
+    if (!titulo || !descripcion) {
+      return res.status(400).json({ error: 'Título y descripción son requeridos' });
+    }
+
+    // Las bobinas que el empleado usa deben estar asignadas a él
+    let bobinasCompletas = [];
+    if (bobinaIds && bobinaIds.length > 0) {
+      bobinasCompletas = await Bobina.find({
+        _id: { $in: bobinaIds },
+        empleadoAsignado: req.user.id,
+        estado: 'asignada',
+        tareaActual: null
+      });
+    }
+
+    // Correr optimizador con las bobinas y tiradas del empleado
+    const { tiradas: tiradasOpt } = optimizarCortes(bobinasCompletas, tiradas || []);
+
+    const task = await Task.create({
+      titulo,
+      descripcion,
+      prioridad: 'media',
+      asignadoA: req.user.id,
+      creadoPor: req.user.id,
+      creadoPorEmpleado: true,
+      bobinas: bobinasCompletas.map(b => b._id),
+      tiradas: tiradasOpt,
+      fotosReferencia: fotosReferencia || [],
+      estado: 'en_progreso',
+      startedAt: new Date(),
+    });
+
+    // Ligar las bobinas a esta nueva tarea para que no se reutilicen
+    if (bobinasCompletas.length > 0) {
+      await Bobina.updateMany(
+        { _id: { $in: bobinasCompletas.map(b => b._id) } },
+        { $set: { tareaActual: task._id } }
+      );
+    }
+
+    const io = req.app.get('io');
+    if (io) io.emit('new_task', task);
+
+    // Notificar a admins que el empleado creó una tarea propia
+    try {
+      const admins = await User.find({ rol: { $in: ['admin', 'dom'] } });
+      for (const admin of admins) {
+        sendPushNotification(admin._id, {
+          title: '⚡ Trabajo registrado por empleado',
+          body: `${req.user.nombre} creó la tarea "${titulo}" usando sus bobinas asignadas.`,
+          url: `/?id=${task._id}`
+        });
+      }
+    } catch(e) {}
+
+    res.status(201).json(task);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ── NUEVO: Empleado marca como finalizado su propio trabajo ─────────────────
+// Dispara la misma lógica que el admin: marca bobinas usadas y cierra la tarea
+router.post('/:id/employee-finalize', async (req, res) => {
+  if (req.user.rol !== 'empleado') {
+    return res.status(403).json({ error: 'Solo empleados pueden usar este endpoint' });
+  }
+  try {
+    const { decisiones, comentarioCierre } = req.body; // decisiones: { bobinaId: 'regresar' | 'desecho' }
+    const tarea = await Task.findById(req.params.id);
+    if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (String(tarea.asignadoA) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'No tienes permiso para finalizar esta tarea' });
+    }
+
+    // Aplicar decisiones sobre las bobinas (regresar al almacén o desechar)
+    for (const bobinaId of tarea.bobinas) {
+      const decision = decisiones ? decisiones[bobinaId] : 'regresar';
+      const nuevoEstado = decision === 'desecho' ? 'desecho' : 'disponible';
+      await Bobina.findByIdAndUpdate(bobinaId, {
+        estado: nuevoEstado,
+        tareaActual: null,
+        empleadoAsignado: null
+      });
+    }
+
+    tarea.estado = 'enviada'; // El admin la revisará y dará visto bueno
+    tarea.completedAt = new Date();
+    if (comentarioCierre) tarea.comentarioCierre = comentarioCierre;
+    await tarea.save();
+
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: tarea._id.toString(), tipo: 'cambio_estado', estado: 'enviada' });
+
+    // Notificar a admins
+    try {
+      const admins = await User.find({ rol: { $in: ['admin', 'dom'] } });
+      for (const admin of admins) {
+        sendPushNotification(admin._id, {
+          title: '✅ Trabajo finalizado por empleado',
+          body: `${req.user.nombre} marcó como finalizado el trabajo: "${tarea.titulo}". Requiere tu revisión.`,
+          url: `/?id=${tarea._id}`
+        });
+      }
+    } catch(e) {}
+
+    res.json(tarea);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 module.exports = router;

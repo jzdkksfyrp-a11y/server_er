@@ -11,6 +11,8 @@ const taskSchema = new mongoose.Schema(
     asignadoA: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     creadoPor: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     cotizacionId: { type: String, default: '' },
+    cotizacionFolio: { type: String, default: '' }, // Folio asignado a posteriori por admin
+    creadoPorEmpleado: { type: Boolean, default: false }, // true si el empleado creó la tarea sin tener asignación previa
     entregableGenerado: { type: Boolean, default: false },
     estado: {
       type: String,

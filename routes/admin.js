@@ -144,4 +144,35 @@ router.delete('/tasks/:id', async (req, res) => {
   }
 });
 
+
+// Asignar folio de cotización a una tarea terminada (solo admin)
+router.patch('/tasks/:id/folio', async (req, res) => {
+  try {
+    const { cotizacionFolio } = req.body;
+    if (!cotizacionFolio) return res.status(400).json({ error: 'Se requiere el folio' });
+    const task = await Task.findByIdAndUpdate(req.params.id, { cotizacionFolio }, { new: true });
+    if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
+    res.json(task);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Cancelar asignación de bobina a empleado (sin tarea) - regresa a disponible
+router.post('/bobina-desasignar/:id', async (req, res) => {
+  try {
+    const bobina = await Bobina.findById(req.params.id);
+    if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
+    if (bobina.estado !== 'asignada' || bobina.tareaActual) {
+      return res.status(400).json({ error: 'Solo puedes desasignar bobinas asignadas directamente a un empleado (sin tarea activa).' });
+    }
+    bobina.estado = 'disponible';
+    bobina.empleadoAsignado = null;
+    await bobina.save();
+    res.json(bobina);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 module.exports = router;
