@@ -11,6 +11,7 @@ const taskSchema = new mongoose.Schema(
     asignadoA: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     creadoPor: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     cotizacionId: { type: String, default: '' },
+    entregableGenerado: { type: Boolean, default: false },
     estado: {
       type: String,
       enum: ['pendiente', 'en_progreso', 'enviada', 'requiere_evidencia', 'revisada'],

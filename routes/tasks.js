@@ -160,6 +160,15 @@ router.patch('/:id/status', async (req, res) => {
   res.json(tarea);
 });
 
+// Marcar tarea con entregable generado
+router.patch('/:id/entregable', async (req, res) => {
+  const tarea = await Task.findByIdAndUpdate(req.params.id, { entregableGenerado: true }, { new: true });
+  if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
+  const io = req.app.get('io');
+  if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'entregable_generado' });
+  res.json(tarea);
+});
+
 // Añadir nueva tirada (Admin / Dom / Empleado)
 router.post('/:id/tiradas', async (req, res) => {
   // Ya no restringimos a admin/dom
