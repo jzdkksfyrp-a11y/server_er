@@ -50,6 +50,17 @@ router.get('/historical', async (req, res) => {
   res.json(tareas);
 });
 
+// ── NUEVO: Obtener bobinas asignadas al empleado logueado ────────────────────
+// IMPORTANTE: Debe ir ANTES de /:id para que Express no confunda "mis-bobinas" con un _id
+router.get('/mis-bobinas', async (req, res) => {
+  try {
+    const bobinas = await Bobina.find({ empleadoAsignado: req.user.id, estado: 'asignada', tareaActual: null });
+    res.json(bobinas);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   const tarea = await Task.findById(req.params.id)
     .select('-fotosReferencia') // Excluir base64 pesada
@@ -331,16 +342,6 @@ router.post('/:id/finalize', async (req, res) => {
   res.json(tarea);
 });
 
-
-// ── NUEVO: Obtener bobinas asignadas al empleado logueado ────────────────────
-router.get('/mis-bobinas', async (req, res) => {
-  try {
-    const bobinas = await Bobina.find({ empleadoAsignado: req.user.id, estado: 'asignada', tareaActual: null });
-    res.json(bobinas);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ── NUEVO: Empleado crea su propia tarea con bobinas que ya tiene asignadas ──
 // El empleado reporta qué hizo, dónde, qué tiradas cortó y sube evidencia
