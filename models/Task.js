@@ -10,6 +10,7 @@ const taskSchema = new mongoose.Schema(
     fotosReferencia: [{ type: String }], // URLs o imagenes en base64
     asignadoA: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     creadoPor: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    cotizacionId: { type: String, default: '' },
     estado: {
       type: String,
       enum: ['pendiente', 'en_progreso', 'enviada', 'requiere_evidencia', 'revisada'],

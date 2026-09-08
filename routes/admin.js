@@ -70,7 +70,7 @@ router.delete('/users/:id', async (req, res) => {
 // Crear tarea con todos sus detalles
 router.post('/tasks', async (req, res) => {
   try {
-    const { titulo, descripcion, prioridad, ubicacion, contacto, fotosReferencia, asignadoA, tiradas, bobinaIds } = req.body;
+    const { titulo, descripcion, prioridad, ubicacion, contacto, fotosReferencia, asignadoA, tiradas, bobinaIds, cotizacionId } = req.body;
     
     // Obtener las bobinas completas desde la base de datos
     let bobinasCompletas = [];
@@ -89,6 +89,7 @@ router.post('/tasks', async (req, res) => {
       contacto,
       fotosReferencia: fotosReferencia || [],
       asignadoA,
+      cotizacionId: cotizacionId || '',
       bobinas: bobinasCompletas.map(b => b._id),
       tiradas: tiradasOpt,
       creadoPor: req.user.esIntegracionExterna ? undefined : req.user.id,

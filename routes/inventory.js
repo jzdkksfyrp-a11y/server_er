@@ -53,6 +53,24 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
+// Asignar bobina directo a un empleado
+router.post('/:id/asignar-empleado', async (req, res) => {
+  if (!['admin', 'dom'].includes(req.user.rol)) {
+    return res.status(403).json({ error: 'No tienes permiso' });
+  }
+  try {
+    const { empleadoId } = req.body;
+    const bobina = await Bobina.findByIdAndUpdate(req.params.id, { 
+      estado: 'asignada', 
+      empleadoAsignado: empleadoId,
+      tareaActual: null 
+    }, { new: true });
+    res.json(bobina);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Editar bobina
 router.put('/:id', async (req, res) => {
   if (!['admin', 'dom'].includes(req.user.rol)) {

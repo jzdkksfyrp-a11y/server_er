@@ -10,7 +10,8 @@ const bobinaSchema = new mongoose.Schema(
       enum: ['disponible', 'asignada', 'agotada', 'desecho'],
       default: 'disponible',
     },
-    tareaActual: { type: mongoose.Schema.Types.ObjectId, ref: 'Task', default: null }
+    tareaActual: { type: mongoose.Schema.Types.ObjectId, ref: 'Task', default: null },
+    empleadoAsignado: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
   },
   { timestamps: true }
 );
