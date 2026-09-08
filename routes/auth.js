@@ -10,7 +10,8 @@ const ROL_MAP = { admin: 'admin', socio: 'dom', user: 'empleado' };
 
 router.get('/users', async (req, res) => {
   try {
-    const users = await User.find({}, 'correo username nombre activo estadoCuenta').sort({ nombre: 1 });
+    // Solo traer los usuarios que fueron creados desde este programa (que tienen el campo creadoPor)
+    const users = await User.find({ creadoPor: { $exists: true } }, 'correo username nombre activo estadoCuenta').sort({ nombre: 1 });
     
     // Filtrar solo los activos
     const activeUsers = users.filter(u => typeof u.activo === 'boolean' ? u.activo : u.estadoCuenta === 'activa');
