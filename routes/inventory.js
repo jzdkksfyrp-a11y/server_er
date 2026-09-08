@@ -53,4 +53,49 @@ router.patch('/:id', async (req, res) => {
   }
 });
 
+// Editar bobina
+router.put('/:id', async (req, res) => {
+  if (!['admin', 'dom'].includes(req.user.rol)) {
+    return res.status(403).json({ error: 'No tienes permiso' });
+  }
+  try {
+    const { nombre, metrosIniciales } = req.body;
+    const bobina = await Bobina.findById(req.params.id);
+    if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
+    
+    // Solo permitir edición si está disponible (por simplicidad matemática)
+    if (bobina.estado !== 'disponible') {
+      return res.status(400).json({ error: 'Solo puedes editar bobinas que están disponibles en almacén' });
+    }
+
+    bobina.nombre = nombre || bobina.nombre;
+    bobina.metrosIniciales = metrosIniciales || bobina.metrosIniciales;
+    bobina.metrosRestantes = bobina.metrosIniciales; // Reset
+    await bobina.save();
+    res.json(bobina);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Eliminar bobina
+router.delete('/:id', async (req, res) => {
+  if (!['admin', 'dom'].includes(req.user.rol)) {
+    return res.status(403).json({ error: 'No tienes permiso' });
+  }
+  try {
+    const bobina = await Bobina.findById(req.params.id);
+    if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
+
+    if (bobina.estado === 'asignada') {
+      return res.status(400).json({ error: 'No puedes eliminar una bobina que actualmente está asignada a una tarea.' });
+    }
+    
+    await Bobina.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 module.exports = router;

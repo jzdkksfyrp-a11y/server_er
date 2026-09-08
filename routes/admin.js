@@ -34,6 +34,39 @@ router.get('/users', async (req, res) => {
   res.json(users);
 });
 
+// Editar usuario
+router.put('/users/:id', async (req, res) => {
+  try {
+    const { nombre, rol, password } = req.body;
+    if (rol && !['empleado', 'dom', 'admin'].includes(rol)) {
+      return res.status(400).json({ error: 'Rol invalido' });
+    }
+    const updateData = {};
+    if (nombre) updateData.nombre = nombre;
+    if (rol) updateData.rol = rol;
+    if (password) {
+      updateData.password = await bcrypt.hash(password, 10);
+    }
+    const user = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).select('-password');
+    res.json(user);
+  } catch (err) {
+    res.status(400).json({ error: 'No se pudo editar el usuario', detalle: err.message });
+  }
+});
+
+// Eliminar usuario
+router.delete('/users/:id', async (req, res) => {
+  try {
+    if (req.params.id === req.user.id) {
+      return res.status(400).json({ error: 'No puedes eliminar tu propio usuario' });
+    }
+    await User.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: 'No se pudo eliminar el usuario', detalle: err.message });
+  }
+});
+
 // Crear tarea con todos sus detalles
 router.post('/tasks', async (req, res) => {
   try {
@@ -82,6 +115,31 @@ router.post('/tasks', async (req, res) => {
     res.status(201).json(task);
   } catch (err) {
     res.status(400).json({ error: 'No se pudo crear la tarea', detalle: err.message });
+  }
+});
+
+// Eliminar tarea (solo admin)
+router.delete('/tasks/:id', async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
+    
+    // Liberar bobinas asignadas
+    if (task.bobinas && task.bobinas.length > 0) {
+      await Bobina.updateMany(
+        { _id: { $in: task.bobinas } },
+        { $set: { estado: 'disponible' }, $unset: { tareaActual: "" } }
+      );
+    }
+    
+    await Task.findByIdAndDelete(req.params.id);
+    
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'borrada' });
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: 'No se pudo eliminar la tarea', detalle: err.message });
   }
 });
 

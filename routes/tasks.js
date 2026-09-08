@@ -187,6 +187,38 @@ router.post('/:id/tiradas', async (req, res) => {
   res.status(201).json(tarea.tiradas[tarea.tiradas.length - 1]);
 });
 
+// Eliminar tirada (Admin / Dom / Empleado)
+router.delete('/:id/tiradas/:index', async (req, res) => {
+  try {
+    const tarea = await Task.findById(req.params.id);
+    if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (tarea.estado === 'revisada') {
+      return res.status(400).json({ error: 'No se pueden modificar tiradas de una tarea ya revisada.' });
+    }
+
+    const index = parseInt(req.params.index, 10);
+    if (isNaN(index) || index < 0 || index >= tarea.tiradas.length) {
+      return res.status(400).json({ error: 'Índice de tirada inválido' });
+    }
+
+    tarea.tiradas.splice(index, 1);
+    
+    // Reoptimizar todas las tiradas usando las bobinas actuales
+    const { bobinas: bobinasOpt, tiradas: tiradasOpt } = optimizarCortes(tarea.bobinas, tarea.tiradas);
+    tarea.bobinas = bobinasOpt;
+    tarea.tiradas = tiradasOpt;
+
+    await tarea.save();
+
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'tirada_eliminada' });
+
+    res.json(tarea);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Añadir bobina existente del inventario a la tarea
 router.post('/:id/bobinas', async (req, res) => {
   const { bobinaId } = req.body;
