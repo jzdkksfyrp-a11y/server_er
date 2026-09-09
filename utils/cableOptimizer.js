@@ -11,7 +11,8 @@ function optimizarCortes(bobinas, tiradas) {
   const bobinasLocales = bobinas.map(b => ({
     nombre: b.nombre,
     metrosIniciales: b.metrosIniciales,
-    metrosRestantes: b.metrosIniciales
+    metrosRestantes: b.metrosIniciales,
+    categoria: b.categoria
   }));
 
   const tiradasLocales = tiradas.map(t => ({
@@ -46,7 +47,8 @@ function optimizarCortes(bobinas, tiradas) {
 
     // Buscar el mejor ajuste (Best Fit)
     bobinasLocales.forEach(bobina => {
-      if (bobina.metrosRestantes >= tirada.metrosEstimados) {
+      // Verificar que el tipo de cable de la bobina coincida con el requerido por la tirada
+      if (bobina.categoria === tirada.cableRequerido && bobina.metrosRestantes >= tirada.metrosEstimados) {
         const sobra = bobina.metrosRestantes - tirada.metrosEstimados;
         if (sobra < menorSobra) {
           menorSobra = sobra;

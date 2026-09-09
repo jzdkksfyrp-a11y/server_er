@@ -28,9 +28,21 @@ router.post('/', async (req, res) => {
     return res.status(403).json({ error: 'No tienes permiso' });
   }
   try {
-    const { nombre, metrosIniciales } = req.body;
+    const { nombre, metrosIniciales, categoria } = req.body;
+
+    // Generar folio de 5 dígitos único
+    let folio;
+    let isUnique = false;
+    while (!isUnique) {
+      folio = Math.floor(10000 + Math.random() * 90000).toString();
+      const existing = await Bobina.findOne({ folio });
+      if (!existing) isUnique = true;
+    }
+
     const bobina = await Bobina.create({
       nombre,
+      categoria: categoria || 'otro',
+      folio,
       metrosIniciales,
       metrosRestantes: metrosIniciales,
       estado: 'disponible'
@@ -79,7 +91,7 @@ router.put('/:id', async (req, res) => {
     return res.status(403).json({ error: 'No tienes permiso' });
   }
   try {
-    const { nombre, metrosIniciales } = req.body;
+    const { nombre, metrosIniciales, categoria } = req.body;
     const bobina = await Bobina.findById(req.params.id);
     if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
     
@@ -89,6 +101,20 @@ router.put('/:id', async (req, res) => {
     }
 
     bobina.nombre = nombre || bobina.nombre;
+    if (categoria) bobina.categoria = categoria;
+    
+    // Generar folio si no tiene (para bobinas existentes antes de la actualización)
+    if (!bobina.folio) {
+      let folio;
+      let isUnique = false;
+      while (!isUnique) {
+        folio = Math.floor(10000 + Math.random() * 90000).toString();
+        const existing = await Bobina.findOne({ folio });
+        if (!existing) isUnique = true;
+      }
+      bobina.folio = folio;
+    }
+
     bobina.metrosIniciales = metrosIniciales || bobina.metrosIniciales;
     bobina.metrosRestantes = bobina.metrosIniciales; // Reset
     await bobina.save();
