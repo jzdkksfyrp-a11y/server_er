@@ -30,7 +30,7 @@ router.post('/users', async (req, res) => {
 
 // Listar usuarios (para el selector de "asignar a" en crear tarea)
 router.get('/users', async (req, res) => {
-  const users = await User.find({ $or: [{ creadoPor: req.user.id }, { _id: req.user.id }] }, '-password').sort({ nombre: 1 });
+  const users = await User.find({ creadoPor: { $exists: true } }, '-password').sort({ nombre: 1 });
   res.json(users);
 });
 

@@ -12,7 +12,8 @@ function optimizarCortes(bobinas, tiradas) {
     nombre: b.nombre,
     metrosIniciales: b.metrosIniciales,
     metrosRestantes: b.metrosIniciales,
-    categoria: b.categoria
+    categoria: b.categoria,
+    bobinaId: b.bobinaId || b._id
   }));
 
   const tiradasLocales = tiradas.map(t => ({
@@ -59,6 +60,7 @@ function optimizarCortes(bobinas, tiradas) {
 
     if (mejorBobina) {
       tirada.bobinaAsignada = mejorBobina.nombre;
+      tirada.bobinaId = mejorBobina.bobinaId;
       mejorBobina.metrosRestantes -= tirada.metrosEstimados;
     } else {
       tirada.bobinaAsignada = "Sin cable suficiente";
