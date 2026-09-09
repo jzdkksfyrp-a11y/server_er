@@ -22,8 +22,8 @@ const taskSchema = new mongoose.Schema(
     bobinas: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Bobina' }],
     tiradas: [{
       nombre: { type: String, required: true },
-      categoria: { type: String, enum: ['camaras', 'aps', 'nodos', 'control_acceso', 'enlace_fibr_mono', 'enlace_fibr_multi'], required: true },
-      cableRequerido: { type: String, enum: ['utp_cat5e', 'utp_cat6', 'utp_cat6a', 'fibra_monomodo', 'fibra_multimodo', 'control_acceso', 'otro'], default: 'utp_cat6' },
+      categoria: { type: String, enum: ['camaras', 'aps', 'nodos', 'control_acceso', 'enlace_fibr_mono', 'enlace_fibr_multi', 'audio'], required: true },
+      cableRequerido: { type: String, enum: ['utp_cat5e', 'utp_cat6', 'utp_cat6a', 'fibra_monomodo', 'fibra_multimodo', 'control_acceso', 'audio', 'otro'], default: 'utp_cat6' },
       metrosEstimados: { type: Number, required: true },
       metrosReales: { type: Number, default: 0 },
       cortado: { type: Boolean, default: false },
