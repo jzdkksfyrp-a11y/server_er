@@ -12,6 +12,8 @@ const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const taskRoutes = require('./routes/tasks');
 const inventoryRoutes = require('./routes/inventory');
+const gpsRoutes = require('./routes/gps');
+const employeeRoutes = require('./routes/employees');
 
 const app = express();
 const http = require('http');
@@ -29,8 +31,13 @@ io.on('connection', (socket) => {
 // Esto permite abrir los HTML directamente sin un servidor HTTP extra.
 const corsOptions = {
   origin: (origin, callback) => {
-    // origin es undefined en Postman/curl, "null" en file:// y *.github.io en prod
-    if (!origin || origin === 'null' || /^http:\/\/localhost/.test(origin) || /\.github\.io$/.test(origin)) {
+    // Acepta: Postman/curl (sin origin), file://, localhost, *.github.io, *.onrender.com
+    const allowed = !origin
+      || origin === 'null'
+      || /^http:\/\/localhost/.test(origin)
+      || /\.github\.io$/.test(origin)
+      || /\.onrender\.com$/.test(origin);
+    if (allowed) {
       callback(null, true);
     } else {
       callback(new Error(`Origen no permitido: ${origin}`));
@@ -54,6 +61,8 @@ app.use('/admin', adminRoutes);
 app.use('/tasks', taskRoutes);
 app.use('/inventory', inventoryRoutes);
 app.use('/push', require('./routes/push').router);
+app.use('/api/empleados', employeeRoutes);
+app.use('/', gpsRoutes);
 
 // La ruta raiz ya la maneja express.static (index.html)
 // Esta ruta es solo para verificar que el API esta activo
