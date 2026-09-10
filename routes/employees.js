@@ -10,11 +10,12 @@ const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
 
 // El CRM de escritorio aún no emite JWT. Se mantiene una ruta de transición
 // con el id de un administrador ya autenticado; para integraciones/producción
-// se recomienda siempre JWT o x-api-key.
+// se recomienda siempre JWT o x-api-key. El expediente solo es administrable
+// por el rol admin (no por socios ni empleados).
 async function requireHRManager(req, res, next) {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) {
-    return verifyToken(req, res, () => requireRole('admin', 'dom', 'socio')(req, res, next));
+    return verifyToken(req, res, () => requireRole('admin')(req, res, next));
   }
   if (req.headers['x-api-key']) return verifyApiKey(req, res, next);
 
@@ -23,8 +24,13 @@ async function requireHRManager(req, res, next) {
     if (!actorId) return res.status(401).json({ error: 'Se requiere una sesión de administrador.' });
     const actor = await User.findById(actorId).select('rol estadoCuenta activo');
     const active = actor && (typeof actor.activo === 'boolean' ? actor.activo : actor.estadoCuenta !== 'inactiva');
-    if (!active || !['admin', 'dom', 'socio'].includes(String(actor.rol || '').toLowerCase())) {
-      return res.status(403).json({ error: 'No tienes permiso para gestionar expedientes.' });
+    const actorRole = String(actor.rol || '').trim();
+    if (!active || actorRole.toLowerCase() !== 'admin') {
+      return res.status(403).json({
+        error: !active
+          ? 'Tu cuenta está inactiva en la base de datos de server_a.'
+          : `Esta sesión tiene el rol "${actorRole || 'sin rol'}" en server_a; los expedientes requieren rol admin.`
+      });
     }
     req.user = { id: actor._id, rol: actor.rol };
     next();
