@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 // El contenido se excluye siempre de las listas; se entrega únicamente al
 // solicitar un archivo concreto desde la ruta protegida de expedientes.
 const employeeDocumentSchema = new mongoose.Schema({
-  usuarioId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  usuarioId: { type: String, required: true, index: true },
   nombre: { type: String, required: true, trim: true },
   tipo: { type: String, trim: true, default: 'Documento' },
   contentType: { type: String, default: 'application/octet-stream' },

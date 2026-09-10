@@ -1,12 +1,28 @@
 const express = require('express');
 const crypto = require('crypto');
-const User = require('../models/User');
+const mongoose = require('mongoose');
 const EmployeeProfile = require('../models/EmployeeProfile');
 const EmployeeDocument = require('../models/EmployeeDocument');
 const { verifyToken, requireRole, verifyApiKey } = require('../middleware/auth');
 
 const router = express.Router();
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
+
+// server_2 define `_id` de users como String, mientras que otras versiones de
+// la app lo crean como ObjectId. Consultamos la colección nativa para no
+// convertir el ID recibido en la sesión ni perder compatibilidad entre ambos.
+function userIdSelector(userId) {
+  const id = String(userId || '').trim();
+  if (!id) return null;
+  if (!mongoose.isValidObjectId(id)) return id;
+  return { $in: [id, new mongoose.Types.ObjectId(id)] };
+}
+
+async function findCRMUser(userId, projection = {}) {
+  const selector = userIdSelector(userId);
+  if (!selector) return null;
+  return mongoose.connection.db.collection('users').findOne({ _id: selector }, { projection });
+}
 
 // El CRM de escritorio aún no emite JWT. Se mantiene una ruta de transición
 // con el id de un administrador ya autenticado; para integraciones/producción
@@ -22,9 +38,9 @@ async function requireHRManager(req, res, next) {
   try {
     const actorId = req.headers['x-crm-user-id'];
     if (!actorId) return res.status(401).json({ error: 'Se requiere una sesión de administrador.' });
-    const actor = await User.findById(actorId).select('rol estadoCuenta activo');
+    const actor = await findCRMUser(actorId, { rol: 1, role: 1, estadoCuenta: 1, activo: 1 });
     const active = actor && (typeof actor.activo === 'boolean' ? actor.activo : actor.estadoCuenta !== 'inactiva');
-    const actorRole = String(actor.rol || '').trim();
+    const actorRole = String(actor?.rol || actor?.role || '').trim();
     if (!active || actorRole.toLowerCase() !== 'admin') {
       return res.status(403).json({
         error: !active
@@ -35,7 +51,8 @@ async function requireHRManager(req, res, next) {
     req.user = { id: actor._id, rol: actor.rol };
     next();
   } catch (error) {
-    res.status(401).json({ error: 'Sesión no válida.' });
+    console.error('[Expedientes] No se pudo validar la sesión:', error.message);
+    res.status(503).json({ error: 'No fue posible validar la sesión porque server_a no puede consultar MongoDB. Revisa MONGODB_URI en el servicio de Render.' });
   }
 }
 
@@ -59,8 +76,8 @@ function dateOrUndefined(value) {
 
 router.get('/', async (req, res) => {
   try {
-    const users = await User.find({}).select('-password -tokenPortal').sort({ nombre: 1, apellido: 1 });
-    const ids = users.map(user => user._id);
+    const users = await mongoose.connection.db.collection('users').find({}).sort({ nombre: 1, apellido: 1 }).toArray();
+    const ids = users.map(user => String(user._id));
     const [profiles, documents] = await Promise.all([
       EmployeeProfile.find({ usuarioId: { $in: ids } }),
       EmployeeDocument.find({ usuarioId: { $in: ids } }).select('-datos').sort({ createdAt: -1 }),
@@ -85,9 +102,9 @@ router.get('/', async (req, res) => {
 router.get('/:userId', async (req, res) => {
   try {
     const [user, profile, documents] = await Promise.all([
-      User.findById(req.params.userId).select('-password -tokenPortal'),
-      EmployeeProfile.findOne({ usuarioId: req.params.userId }),
-      EmployeeDocument.find({ usuarioId: req.params.userId }).select('-datos').sort({ createdAt: -1 }),
+      findCRMUser(req.params.userId, { password: 0, tokenPortal: 0 }),
+      EmployeeProfile.findOne({ usuarioId: String(req.params.userId) }),
+      EmployeeDocument.find({ usuarioId: String(req.params.userId) }).select('-datos').sort({ createdAt: -1 }),
     ]);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     res.json({ usuario: publicUser(user), perfil: profilePayload(profile), documentos });
@@ -113,11 +130,14 @@ router.put('/:userId', async (req, res) => {
       if (perfil[field] && typeof perfil[field] === 'object') profileUpdate[field] = perfil[field];
     });
 
-    const user = await User.findByIdAndUpdate(req.params.userId, { $set: userUpdate }, { new: true, runValidators: true }).select('-password -tokenPortal');
+    const existingUser = await findCRMUser(req.params.userId, { _id: 1 });
+    if (!existingUser) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    await mongoose.connection.db.collection('users').updateOne({ _id: existingUser._id }, { $set: userUpdate });
+    const user = await mongoose.connection.db.collection('users').findOne({ _id: existingUser._id }, { projection: { password: 0, tokenPortal: 0 } });
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const profile = await EmployeeProfile.findOneAndUpdate(
-      { usuarioId: user._id },
-      { $set: profileUpdate, $setOnInsert: { usuarioId: user._id } },
+      { usuarioId: String(user._id) },
+      { $set: profileUpdate, $setOnInsert: { usuarioId: String(user._id) } },
       { new: true, upsert: true, setDefaultsOnInsert: true },
     );
     res.json({ usuario: publicUser(user), perfil: profilePayload(profile) });
@@ -133,9 +153,9 @@ router.post('/:userId/documentos', async (req, res) => {
     const data = datos.replace(/^data:[^;]+;base64,/, '');
     const size = Buffer.byteLength(data, 'base64');
     if (!Number.isFinite(size) || size > MAX_DOCUMENT_BYTES) return res.status(413).json({ error: 'Cada documento puede pesar hasta 8 MB.' });
-    const user = await User.findById(req.params.userId).select('_id');
+    const user = await findCRMUser(req.params.userId, { _id: 1 });
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    const document = await EmployeeDocument.create({ usuarioId: user._id, nombre, tipo, contentType, tamanio: size, datos: data });
+    const document = await EmployeeDocument.create({ usuarioId: String(user._id), nombre, tipo, contentType, tamanio: size, datos: data });
     res.status(201).json(document.toObject({ transform: (_, value) => { delete value.datos; return value; } }));
   } catch (error) {
     res.status(400).json({ error: 'No se pudo subir el documento.' });
@@ -144,7 +164,7 @@ router.post('/:userId/documentos', async (req, res) => {
 
 router.get('/:userId/documentos/:documentId/archivo', async (req, res) => {
   try {
-    const document = await EmployeeDocument.findOne({ _id: req.params.documentId, usuarioId: req.params.userId }).select('+datos');
+    const document = await EmployeeDocument.findOne({ _id: req.params.documentId, usuarioId: String(req.params.userId) }).select('+datos');
     if (!document) return res.status(404).json({ error: 'Documento no encontrado.' });
     res.type(document.contentType || 'application/octet-stream');
     res.set('Content-Disposition', `inline; filename="${String(document.nombre).replace(/[\r\n"]/g, '')}"`);
@@ -156,7 +176,7 @@ router.get('/:userId/documentos/:documentId/archivo', async (req, res) => {
 
 router.delete('/:userId/documentos/:documentId', async (req, res) => {
   try {
-    const document = await EmployeeDocument.findOneAndDelete({ _id: req.params.documentId, usuarioId: req.params.userId });
+    const document = await EmployeeDocument.findOneAndDelete({ _id: req.params.documentId, usuarioId: String(req.params.userId) });
     if (!document) return res.status(404).json({ error: 'Documento no encontrado.' });
     res.json({ success: true });
   } catch (error) {
@@ -211,9 +231,9 @@ router.post('/:userId/acceso/hikvision/sincronizar', async (req, res) => {
   const config = hikvisionConfig();
   if (!config) return res.status(503).json({ error: 'Hikvision no está configurado en el servidor. Define HIKVISION_ISAPI_URL, HIKVISION_USERNAME y HIKVISION_PASSWORD.' });
   try {
-    const user = await User.findById(req.params.userId).select('nombre apellido');
+    const user = await findCRMUser(req.params.userId, { nombre: 1, apellido: 1 });
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    const profile = await EmployeeProfile.findOne({ usuarioId: user._id });
+    const profile = await EmployeeProfile.findOne({ usuarioId: String(user._id) });
     const access = { ...(profile?.acceso?.toObject?.() || profile?.acceso || {}), ...(req.body?.acceso || {}) };
     const employeeNo = String(access.employeeNo || user._id);
     const cardNo = String(access.tarjetaNumero || '').trim();
@@ -226,12 +246,12 @@ router.post('/:userId/acceso/hikvision/sincronizar', async (req, res) => {
     const cardResponse = await hikvisionPost(config, '/ISAPI/AccessControl/CardInfo/Record?format=json', { CardInfo: { employeeNo, cardNo, cardType: 'normalCard', Valid: valid } });
     const cardResult = await cardResponse.text();
     if (!cardResponse.ok) throw new Error(`El controlador rechazó la tarjeta (${cardResponse.status}): ${cardResult.slice(0, 220)}`);
-    const saved = await EmployeeProfile.findOneAndUpdate({ usuarioId: user._id }, { $set: {
+    const saved = await EmployeeProfile.findOneAndUpdate({ usuarioId: String(user._id) }, { $set: {
       'acceso.employeeNo': employeeNo, 'acceso.tarjetaNumero': cardNo, 'acceso.estado': 'Activa en Hikvision', 'acceso.ultimaSincronizacion': new Date(), 'acceso.ultimoResultado': 'Tarjeta sincronizada',
-    }, $setOnInsert: { usuarioId: user._id } }, { new: true, upsert: true, setDefaultsOnInsert: true });
+    }, $setOnInsert: { usuarioId: String(user._id) } }, { new: true, upsert: true, setDefaultsOnInsert: true });
     res.json({ success: true, perfil: profilePayload(saved), personaRegistrada: personResponse.ok });
   } catch (error) {
-    await EmployeeProfile.findOneAndUpdate({ usuarioId: req.params.userId }, { $set: { 'acceso.estado': 'Error de sincronización', 'acceso.ultimoResultado': error.message, 'acceso.ultimaSincronizacion': new Date() } }).catch(() => {});
+    await EmployeeProfile.findOneAndUpdate({ usuarioId: String(req.params.userId) }, { $set: { 'acceso.estado': 'Error de sincronización', 'acceso.ultimoResultado': error.message, 'acceso.ultimaSincronizacion': new Date() } }).catch(() => {});
     res.status(502).json({ error: error.message || 'No fue posible comunicar con Hikvision.' });
   }
 });

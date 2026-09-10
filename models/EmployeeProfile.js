@@ -3,7 +3,9 @@ const mongoose = require('mongoose');
 // Información laboral y administrativa. Se guarda aparte de `users` para que
 // los flujos de autenticación no expongan datos sensibles del expediente.
 const employeeProfileSchema = new mongoose.Schema({
-  usuarioId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, unique: true, index: true },
+  // La colección users del CRM histórico usa _id String. Conservarlo como
+  // texto también permite convivir con cuentas cuyo _id sea ObjectId.
+  usuarioId: { type: String, required: true, unique: true, index: true },
   puesto: { type: String, trim: true, default: '' },
   departamento: { type: String, trim: true, default: '' },
   sucursal: { type: String, trim: true, default: '' },
