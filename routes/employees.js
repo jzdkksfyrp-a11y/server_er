@@ -48,12 +48,13 @@ async function findCRMUser(userId, projection = {}) {
   const id = String(userId || '').trim();
   if (!id) return null;
   const users = mongoose.connection.db.collection('users');
+  const options = Object.keys(projection || {}).length ? { projection } : undefined;
   // El CRM histórico ha usado ambos tipos de _id. Nunca envíes un selector
   // mixto al driver: primero consulta exactamente el valor de la sesión y,
   // únicamente si no existe, usa ObjectId como compatibilidad.
-  let user = await users.findOne({ _id: id }, { projection });
+  let user = await users.findOne({ _id: id }, options);
   if (!user && mongoose.isValidObjectId(id)) {
-    user = await users.findOne({ _id: new mongoose.Types.ObjectId(id) }, { projection });
+    user = await users.findOne({ _id: new mongoose.Types.ObjectId(id) }, options);
   }
   return user;
 }
