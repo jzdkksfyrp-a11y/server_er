@@ -64,18 +64,16 @@ async function findCRMUser(userId, projection = {}, requestedType = '') {
   if (!id) return null;
   const users = mongoose.connection.db.collection('users');
   const options = Object.keys(projection || {}).length ? { projection } : undefined;
-  // El cliente de Expedientes conserva el tipo BSON del _id. Es imprescindible
-  // cuando existen datos históricos con el mismo texto como String y ObjectId.
   const exactSelector = userSelector(id, requestedType);
-  if (exactSelector) return users.findOne(exactSelector, options);
-  // El CRM histórico ha usado ambos tipos de _id. Nunca envíes un selector
-  // mixto al driver: primero consulta exactamente el valor de la sesión y,
-  // únicamente si no existe, usa ObjectId como compatibilidad.
-  let user = await users.findOne({ _id: id }, options);
-  if (!user && mongoose.isValidObjectId(id)) {
-    user = await users.findOne({ _id: new mongoose.Types.ObjectId(id) }, options);
+  if (exactSelector) {
+    const exactList = await users.find(exactSelector, options).limit(1).toArray();
+    if (exactList.length) return exactList[0];
   }
-  return user;
+  let list = await users.find({ _id: id }, options).limit(1).toArray();
+  if (!list.length && mongoose.isValidObjectId(id)) {
+    list = await users.find({ _id: new mongoose.Types.ObjectId(id) }, options).limit(1).toArray();
+  }
+  return list[0] || null;
 }
 
 // El CRM de escritorio aún no emite JWT. Se mantiene una ruta de transición
@@ -207,8 +205,8 @@ router.post('/', async (req, res) => {
     const rol = ['admin', 'socio', 'user'].includes(usuario.rol) ? usuario.rol : 'user';
     if (!nombre || !correo) return res.status(400).json({ error: 'Nombre y correo son obligatorios.' });
     if (crearAcceso && String(password || '').length < 10) return res.status(400).json({ error: 'La contraseña temporal debe tener al menos 10 caracteres.' });
-    const exists = await mongoose.connection.db.collection('users').findOne({ correo }, { projection: { _id: 1 } });
-    if (exists) return res.status(409).json({ error: 'Ya existe una cuenta con ese correo.' });
+    const existsList = await mongoose.connection.db.collection('users').find({ correo }, { projection: { _id: 1 } }).limit(1).toArray();
+    if (existsList.length) return res.status(409).json({ error: 'Ya existe una cuenta con ese correo.' });
 
     const userId = new mongoose.Types.ObjectId().toString();
     const estadoCuenta = crearAcceso ? 'pendiente' : 'inactiva';
@@ -286,7 +284,8 @@ router.put('/:userId', async (req, res) => {
     const existingUser = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!existingUser) return res.status(404).json({ error: 'Empleado no encontrado.' });
     await mongoose.connection.db.collection('users').updateOne({ _id: existingUser._id }, { $set: userUpdate });
-    const user = await mongoose.connection.db.collection('users').findOne({ _id: existingUser._id }, { projection: { password: 0, tokenPortal: 0 } });
+    const userList = await mongoose.connection.db.collection('users').find({ _id: existingUser._id }, { projection: { password: 0, tokenPortal: 0 } }).limit(1).toArray();
+    const user = userList[0];
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const profile = await EmployeeProfile.findOneAndUpdate(
       { usuarioId: String(user._id) },
