@@ -204,7 +204,13 @@ router.get('/:userId', async (req, res) => {
   try {
     // Leer al usuario primero. Un expediente o documento legado defectuoso no
     // debe impedir abrir y editar la ficha básica de un empleado existente.
-    const user = await findCRMUser(req.params.userId);
+    // Usamos la misma lectura nativa que ya alimenta GET /api/empleados. En
+    // esta base conviven _id String y ObjectId; algunos despliegues de Render
+    // fallaban con findOne sobre los IDs String, pero find({}) funciona para
+    // ambos y el conjunto actual es pequeño.
+    const requestedId = String(req.params.userId || '').trim();
+    const users = await mongoose.connection.db.collection('users').find({}).toArray();
+    const user = users.find(item => String(item._id) === requestedId);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const employeeId = String(user._id);
     let profile = null;
@@ -220,7 +226,7 @@ router.get('/:userId', async (req, res) => {
     res.json({
       usuario: publicUser(user),
       perfil,
-      documentos,
+      documentos: documents,
       documentosLegacy: legacyDocuments(user),
       warnings,
     });
