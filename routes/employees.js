@@ -119,7 +119,8 @@ function publicUser(user) {
 }
 
 function profilePayload(profile) {
-  return profile ? profile.toObject() : {};
+  if (!profile) return {};
+  return typeof profile.toObject === 'function' ? profile.toObject() : profile;
 }
 
 function cleanEmployee(user) {

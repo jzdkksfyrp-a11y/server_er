@@ -10,6 +10,7 @@ const User = require('../models/User');
 
 const FLESPI_TOKEN = '933gcAbczGluPERbGkm0ktw72AEA829Jnf1pEEhO8dFjRtJXRfoY2ejMgNkxafb6';
 
+
 async function sendFlespiCommand(flespiId, action) {
     if (!flespiId) return;
     try {
