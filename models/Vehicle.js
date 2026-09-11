@@ -1,6 +1,9 @@
 const mongoose = require('mongoose');
 
 const VehicleSchema = new mongoose.Schema({
+    // FIX B: _id como String para compatibilidad con datos del servidor original
+    // El server.js original usa _id String, sin esto los findById() fallan en documentos existentes
+    _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
     marca: { type: String, required: true },
     modelo: { type: String, required: true },
     color: { type: String, required: true },

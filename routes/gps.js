@@ -525,19 +525,36 @@ router.put('/api/tracking/vehiculos/swap-crm', async (req, res) => {
     }
 });
 
+// FIX C: Buffer de diagnóstico — guarda los últimos 10 payloads recibidos de Flespi
+// Portado del server.js original. Ver en: GET /api/flespi/debug
+const flespiDebugLog = [];
+
+router.get('/api/flespi/debug', (req, res) => {
+    res.json({ total: flespiDebugLog.length, last10: flespiDebugLog });
+});
+
 router.post('/api/flespi/webhook', async (req, res) => {
+    // Responder 200 inmediatamente a Flespi para evitar timeouts
+    res.status(200).send('OK');
+
     try {
         let data = req.body;
-        if (!Array.isArray(data)) data = [data]; 
-        if (Array.isArray(data)) {
-            for (let msg of data) {
+
+        // Guardar en buffer de diagnóstico (últimos 10)
+        flespiDebugLog.unshift({ receivedAt: new Date().toISOString(), body: data });
+        if (flespiDebugLog.length > 10) flespiDebugLog.pop();
+        if (!Array.isArray(data)) data = [data];
+
+        for (const msg of data) {
+            // FIX 3: try/catch por mensaje individual — un mensaje malo no mata el batch completo
+            try {
                 const imei = msg.ident;
                 const lat = msg['position.latitude'];
                 const lng = msg['position.longitude'];
                 const speed = msg['position.speed'] || msg['obd.vehicle.speed'] || msg['can.vehicle.speed'] || 0;
                 const direction = msg['position.direction'] || 0;
                 const ignition = msg['engine.ignition.status'] !== undefined ? (msg['engine.ignition.status'] || speed > 0) : (speed > 0);
-                
+
                 const engineRPM = msg['can.engine.rpm'] || msg['obd.engine.rpm'] || 0;
                 const batteryVoltage = msg['battery.voltage'] || 0;
                 const externalVoltage = msg['external.powersource.voltage'] || msg['can.vehicle.battery.level'] || 0;
@@ -548,61 +565,81 @@ router.post('/api/flespi/webhook', async (req, res) => {
 
                 const timestamp = msg.timestamp ? new Date(msg.timestamp * 1000) : new Date();
 
-                if (imei && lat !== undefined && lng !== undefined) {
-                    const vehicle = await Vehicle.findOne({ imei: String(imei) });
-                    if (vehicle) {
-                        if (vehicle.ghostMode) continue;
-                        
-                        const newLoc = { lat, lng, speed, direction, ignition, engineRPM, batteryVoltage, externalVoltage, fuelLevel, engineTemp, mileage, dtcCount, timestamp, rawData: msg };
-                        const isMoving = speed > 3;
+                if (!imei || lat === undefined || lng === undefined) continue;
 
-                        if (!isMoving && !vehicle.currentStopId) {
-                            const stop = new VehicleStop({ vehicleId: vehicle._id, userId: vehicle.currentUserId, userName: vehicle.currentUserName, lat, lng, startTime: timestamp });
-                            await stop.save();
-                            vehicle.currentStopId = stop._id;
-                        } else if (isMoving && vehicle.currentStopId) {
-                            const stop = await VehicleStop.findById(vehicle.currentStopId);
-                            if (stop) {
-                                stop.endTime = timestamp;
-                                stop.durationMinutes = Math.max(0, Math.round((timestamp - stop.startTime) / 60000));
-                                await stop.save();
-                            }
-                            vehicle.currentStopId = null;
-                        }
-
-                        vehicle.lastLocation = newLoc;
-
-                        VehicleRoutePoint.create({
-                            vehicleId: vehicle._id, lat, lng, speed, ignition, engineRPM, batteryVoltage, externalVoltage, fuelLevel, engineTemp, mileage, dtcCount, timestamp
-                        }).catch(err => console.error('Error saving route point:', err));
-
-                        if (!vehicle.locationHistory) vehicle.locationHistory = [];
-                        vehicle.locationHistory.push(newLoc);
-                        if (vehicle.locationHistory.length > 100) vehicle.locationHistory = vehicle.locationHistory.slice(-100);
-
-                        await vehicle.save();
-                        let currentStopStartTime = null;
-                        if (vehicle.currentStopId) {
-                            const activeStop = await VehicleStop.findById(vehicle.currentStopId);
-                            if (activeStop) currentStopStartTime = activeStop.startTime;
-                        }
-
-                        const io = req.app.get('io');
-                        if (io) {
-                            io.emit('vehicle_location_update', {
-                                vehicleId: vehicle._id, gpsModel: vehicle.gpsModel, imei, lat, lng, speed, direction, ignition, engineRPM, batteryVoltage, externalVoltage, fuelLevel, engineTemp, mileage, dtcCount, timestamp, rawData: msg,
-                                route: vehicle.locationHistory, currentStopStartTime
-                            });
-                        }
-                    }
+                const vehicle = await Vehicle.findOne({ imei: String(imei) });
+                if (!vehicle) {
+                    console.warn(`[FLESPI] IMEI desconocido: ${imei}`);
+                    continue;
                 }
+                if (vehicle.ghostMode) continue;
+
+                // FIX 1: rawData solo va a lastLocation, NO al historial.
+                // Antes se guardaba rawData en cada entrada de locationHistory (100 entradas × objeto Flespi completo)
+                // eso hacia crecer el documento de MongoDB hasta superar 16MB → vehicle.save() explotaba con error 500.
+                const newLocForHistory = { lat, lng, speed, direction, ignition, engineRPM, batteryVoltage, externalVoltage, fuelLevel, engineTemp, mileage, dtcCount, timestamp };
+                const newLocFull = { ...newLocForHistory, rawData: msg };
+
+                const isMoving = speed > 3;
+
+                // FIX 2: currentStopId se guarda como String explícito.
+                // stop._id es ObjectId pero el schema lo define como String — sin .toString() 
+                // puede causar errores de casteo en findById posteriores.
+                if (!isMoving && !vehicle.currentStopId) {
+                    const stop = new VehicleStop({ vehicleId: vehicle._id, userId: vehicle.currentUserId, userName: vehicle.currentUserName, lat, lng, startTime: timestamp });
+                    await stop.save();
+                    vehicle.currentStopId = stop._id.toString();
+                } else if (isMoving && vehicle.currentStopId) {
+                    const stop = await VehicleStop.findById(vehicle.currentStopId);
+                    if (stop) {
+                        stop.endTime = timestamp;
+                        stop.durationMinutes = Math.max(0, Math.round((timestamp - stop.startTime) / 60000));
+                        await stop.save();
+                    }
+                    vehicle.currentStopId = null;
+                }
+
+                vehicle.lastLocation = newLocFull;
+
+                VehicleRoutePoint.create({
+                    vehicleId: vehicle._id, lat, lng, speed, ignition, engineRPM, batteryVoltage, externalVoltage, fuelLevel, engineTemp, mileage, dtcCount, timestamp
+                }).catch(err => console.error('[FLESPI] Error guardando RoutePoint:', err.message));
+
+                if (!vehicle.locationHistory) vehicle.locationHistory = [];
+                vehicle.locationHistory.push(newLocForHistory); // sin rawData
+                if (vehicle.locationHistory.length > 100) vehicle.locationHistory = vehicle.locationHistory.slice(-100);
+
+                await vehicle.save();
+
+                let currentStopStartTime = null;
+                if (vehicle.currentStopId) {
+                    const activeStop = await VehicleStop.findById(vehicle.currentStopId);
+                    if (activeStop) currentStopStartTime = activeStop.startTime;
+                }
+
+                const io = req.app.get('io');
+                if (io) {
+                    io.emit('vehicle_location_update', {
+                        vehicleId: vehicle._id, gpsModel: vehicle.gpsModel, imei, lat, lng, speed, direction, ignition,
+                        engineRPM, batteryVoltage, externalVoltage, fuelLevel, engineTemp, mileage, dtcCount, timestamp,
+                        rawData: msg, route: vehicle.locationHistory, currentStopStartTime
+                    });
+                }
+
+            } catch (msgErr) {
+                // Log detallado por mensaje — así en los logs de Render ves exactamente qué falló
+                console.error(`[FLESPI] Error procesando mensaje (IMEI: ${msg.ident}):`, msgErr.name, msgErr.message);
             }
         }
-        res.status(200).send('OK');
     } catch (e) {
-        console.error('Flespi webhook error:', e);
-        res.status(500).send('Error');
+        console.error('[FLESPI] Error general en webhook:', e.name, e.message);
     }
+});
+
+// Flespi hace GET al webhook para verificar conectividad del stream
+// Sin este handler devuelve 404 que aparece como error en el panel de Flespi
+router.get('/api/flespi/webhook', (req, res) => {
+    res.status(200).send('Flespi webhook activo');
 });
 
 module.exports = router;
