@@ -106,6 +106,29 @@ function cleanEmployee(user) {
   return publicUser(user || {});
 }
 
+// Los empleados ya existentes guardan parte del expediente directamente en
+// users. Se usan como valores iniciales hasta que el administrador complete el
+// perfil nuevo, sin mover ni sobrescribir datos históricos.
+function legacyProfileValues(user) {
+  return {
+    fechaIngreso: user.fechaIngreso || null,
+    nss: user.nss || '',
+    rfc: user.rfc || '',
+    numeroEmpleado: user.numeroEmpleado || '',
+  };
+}
+
+function legacyDocuments(user) {
+  return Array.isArray(user.documentos) ? user.documentos.map(document => ({
+    _id: String(document?._id || ''),
+    nombre: String(document?.nombre || 'Documento histórico'),
+    tipo: 'Documento histórico',
+    url: String(document?.url || ''),
+    fecha: document?.fecha || null,
+    legacy: true,
+  })) : [];
+}
+
 function dateOrUndefined(value) {
   if (!value) return undefined;
   const date = new Date(value);
@@ -190,7 +213,16 @@ router.get('/:userId', async (req, res) => {
     catch (error) { warnings.push('No se pudo cargar el perfil complementario.'); console.error('[Expedientes] Perfil:', error.message); }
     try { documents = await EmployeeDocument.find({ usuarioId: employeeId }).select('-datos').sort({ createdAt: -1 }).lean(); }
     catch (error) { warnings.push('No se pudieron cargar los documentos.'); console.error('[Expedientes] Documentos:', error.message); }
-    res.json({ usuario: publicUser(user), perfil: profile || {}, documentos, warnings });
+    // El perfil nuevo tiene prioridad; los campos heredados completan solo lo
+    // que todavía no se haya capturado en employee_profiles.
+    const perfil = { ...legacyProfileValues(user), ...(profile || {}) };
+    res.json({
+      usuario: publicUser(user),
+      perfil,
+      documentos,
+      documentosLegacy: legacyDocuments(user),
+      warnings,
+    });
   } catch (error) {
     console.error('[Expedientes] Error cargando expediente:', req.params.userId, error.message);
     res.status(500).json({ error: 'No se pudo leer el usuario desde MongoDB.', detalle: process.env.NODE_ENV === 'production' ? undefined : error.message });
