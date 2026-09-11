@@ -157,7 +157,15 @@ function dateOrUndefined(value) {
 
 router.get('/', async (req, res) => {
   try {
-    const users = await mongoose.connection.db.collection('users').find({}).sort({ nombre: 1, apellido: 1 }).toArray();
+    // La lista solo necesita un resumen. Los PDFs/imágenes históricos pueden
+    // ser muy pesados y se consultan únicamente al abrir ese expediente.
+    const users = await mongoose.connection.db.collection('users').find({}, {
+      projection: {
+        _id: 1, nombre: 1, apellido: 1, correo: 1, telefono: 1, rol: 1,
+        role: 1, estadoCuenta: 1, accesoCrm: 1, permisosCrm: 1,
+        fechaIngreso: 1, nss: 1, rfc: 1, numeroEmpleado: 1, categoria: 1,
+      },
+    }).sort({ nombre: 1, apellido: 1 }).toArray();
     // Una versión antigua generó algunos registros sombra: mismo texto de _id,
     // pero distinto tipo BSON. No se borran aquí; solo mostramos la identidad
     // con datos reales para evitar editar por accidente la cuenta equivocada.
@@ -171,21 +179,13 @@ router.get('/', async (req, res) => {
     });
     const visibleUsers = [...usersById.values()];
     const ids = visibleUsers.map(user => String(user._id));
-    const [profiles, documents] = await Promise.all([
-      EmployeeProfile.find({ usuarioId: { $in: ids } }),
-      EmployeeDocument.find({ usuarioId: { $in: ids } }).select('-datos').sort({ createdAt: -1 }),
-    ]);
+    const profiles = await EmployeeProfile.find({ usuarioId: { $in: ids } })
+      .select('usuarioId puesto departamento estadoLaboral fechaIngreso')
+      .lean();
     const profileByUser = new Map(profiles.map(profile => [String(profile.usuarioId), profilePayload(profile)]));
-    const docsByUser = new Map();
-    documents.forEach(document => {
-      const key = String(document.usuarioId);
-      if (!docsByUser.has(key)) docsByUser.set(key, []);
-      docsByUser.get(key).push(document.toObject());
-    });
     res.json({ empleados: visibleUsers.map(user => ({
       usuario: publicUser(user),
       perfil: profileByUser.get(String(user._id)) || {},
-      documentos: docsByUser.get(String(user._id)) || [],
     })) });
   } catch (error) {
     res.status(500).json({ error: 'No se pudieron cargar los expedientes.' });
