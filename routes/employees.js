@@ -44,17 +44,18 @@ async function audit(req, empleadoId, accion, detalle = '', metadatos = {}) {
 // server_2 define `_id` de users como String, mientras que otras versiones de
 // la app lo crean como ObjectId. Consultamos la colección nativa para no
 // convertir el ID recibido en la sesión ni perder compatibilidad entre ambos.
-function userIdSelector(userId) {
+async function findCRMUser(userId, projection = {}) {
   const id = String(userId || '').trim();
   if (!id) return null;
-  if (!mongoose.isValidObjectId(id)) return id;
-  return { $in: [id, new mongoose.Types.ObjectId(id)] };
-}
-
-async function findCRMUser(userId, projection = {}) {
-  const selector = userIdSelector(userId);
-  if (!selector) return null;
-  return mongoose.connection.db.collection('users').findOne({ _id: selector }, { projection });
+  const users = mongoose.connection.db.collection('users');
+  // El CRM histórico ha usado ambos tipos de _id. Nunca envíes un selector
+  // mixto al driver: primero consulta exactamente el valor de la sesión y,
+  // únicamente si no existe, usa ObjectId como compatibilidad.
+  let user = await users.findOne({ _id: id }, { projection });
+  if (!user && mongoose.isValidObjectId(id)) {
+    user = await users.findOne({ _id: new mongoose.Types.ObjectId(id) }, { projection });
+  }
+  return user;
 }
 
 // El CRM de escritorio aún no emite JWT. Se mantiene una ruta de transición
@@ -177,16 +178,22 @@ router.post('/', async (req, res) => {
 
 router.get('/:userId', async (req, res) => {
   try {
-    const [user, profile, documents] = await Promise.all([
-      findCRMUser(req.params.userId, { password: 0, tokenPortal: 0 }),
-      EmployeeProfile.findOne({ usuarioId: String(req.params.userId) }),
-      EmployeeDocument.find({ usuarioId: String(req.params.userId) }).select('-datos').sort({ createdAt: -1 }),
-    ]);
+    // Leer al usuario primero. Un expediente o documento legado defectuoso no
+    // debe impedir abrir y editar la ficha básica de un empleado existente.
+    const user = await findCRMUser(req.params.userId);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    res.json({ usuario: publicUser(user), perfil: profilePayload(profile), documentos });
+    const employeeId = String(user._id);
+    let profile = null;
+    let documents = [];
+    const warnings = [];
+    try { profile = await EmployeeProfile.findOne({ usuarioId: employeeId }).lean(); }
+    catch (error) { warnings.push('No se pudo cargar el perfil complementario.'); console.error('[Expedientes] Perfil:', error.message); }
+    try { documents = await EmployeeDocument.find({ usuarioId: employeeId }).select('-datos').sort({ createdAt: -1 }).lean(); }
+    catch (error) { warnings.push('No se pudieron cargar los documentos.'); console.error('[Expedientes] Documentos:', error.message); }
+    res.json({ usuario: publicUser(user), perfil: profile || {}, documentos, warnings });
   } catch (error) {
     console.error('[Expedientes] Error cargando expediente:', req.params.userId, error.message);
-    res.status(500).json({ error: 'No se pudo cargar el expediente. Revisa la conexión de server_a con MongoDB.' });
+    res.status(500).json({ error: 'No se pudo leer el usuario desde MongoDB.', detalle: process.env.NODE_ENV === 'production' ? undefined : error.message });
   }
 });
 
