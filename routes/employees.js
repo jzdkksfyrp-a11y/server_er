@@ -8,17 +8,19 @@ const { verifyToken, requireRole, verifyApiKey } = require('../middleware/auth')
 
 const router = express.Router();
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
+// Únicamente módulos visibles en el menú lateral de proyectos.html. No se
+// exponen permisos internos o de acciones individuales en este expediente.
 const CRM_PERMISSIONS = [
-  ['dashboard.ver', 'Panel principal'],
-  ['cotizaciones.ver', 'Ver cotizaciones'], ['cotizaciones.editar', 'Crear y editar cotizaciones'],
-  ['precios.ver', 'Ver tabulador'], ['precios.editar', 'Administrar tabulador'],
-  ['proyectos.ver', 'Ver proyectos'], ['proyectos.editar', 'Administrar proyectos'],
-  ['tareas.ver', 'Ver tareas'], ['tareas.editar', 'Administrar tareas'],
-  ['agenda.ver', 'Ver agenda'], ['agenda.editar', 'Administrar agenda'],
-  ['entregables.ver', 'Ver entregables'], ['entregables.crear', 'Crear entregables'],
-  ['correo.ver', 'Consultar correo'], ['correo.enviar', 'Enviar correo'],
-  ['tracking.ver', 'Ver tracking e inventario'], ['tracking.operar', 'Operar tracking e inventario'],
-  ['finanzas.ver', 'Ver finanzas'], ['finanzas.editar', 'Administrar finanzas'],
+  ['modulo.dashboard', 'Panel principal'],
+  ['modulo.cotizaciones', 'Cotizaciones'],
+  ['modulo.precios', 'Tabulador de precios'],
+  ['modulo.proyectos', 'Proyectos activos'],
+  ['modulo.correo', 'Correo electrónico'],
+  ['modulo.entregables', 'Entregables'],
+  ['modulo.tareas', 'Tareas'],
+  ['modulo.appTareas', 'App Tareas'],
+  ['modulo.agenda', 'Agenda inteligente'],
+  ['modulo.finanzas', 'Finanzas'],
 ];
 const VALID_PERMISSIONS = new Set(CRM_PERMISSIONS.map(([key]) => key));
 const VALID_ACCOUNT_STATES = new Set(['pendiente', 'activa', 'inactiva', 'suspendida', 'revocada']);
@@ -31,8 +33,8 @@ function passwordHash(password) {
 
 function defaultPermissions(role) {
   if (role === 'admin') return CRM_PERMISSIONS.map(([key]) => key);
-  if (role === 'socio') return ['dashboard.ver', 'cotizaciones.ver', 'cotizaciones.editar', 'precios.ver', 'proyectos.ver', 'proyectos.editar', 'tareas.ver', 'tareas.editar', 'agenda.ver', 'agenda.editar', 'entregables.ver', 'entregables.crear', 'correo.ver', 'correo.enviar', 'tracking.ver', 'tracking.operar'];
-  return ['dashboard.ver', 'tareas.ver', 'entregables.ver'];
+  if (role === 'socio') return ['modulo.dashboard', 'modulo.cotizaciones', 'modulo.precios', 'modulo.proyectos', 'modulo.correo', 'modulo.entregables', 'modulo.tareas', 'modulo.appTareas', 'modulo.agenda'];
+  return ['modulo.dashboard', 'modulo.tareas', 'modulo.entregables'];
 }
 
 async function audit(req, empleadoId, accion, detalle = '', metadatos = {}) {
@@ -44,11 +46,28 @@ async function audit(req, empleadoId, accion, detalle = '', metadatos = {}) {
 // server_2 define `_id` de users como String, mientras que otras versiones de
 // la app lo crean como ObjectId. Consultamos la colección nativa para no
 // convertir el ID recibido en la sesión ni perder compatibilidad entre ambos.
-async function findCRMUser(userId, projection = {}) {
+function userIdType(user) {
+  return user?._id?._bsontype === 'ObjectId' || user?._id instanceof mongoose.Types.ObjectId ? 'objectId' : 'string';
+}
+
+function userSelector(userId, requestedType = '') {
+  const id = String(userId || '').trim();
+  const type = String(requestedType || '').toLowerCase();
+  if (!id) return null;
+  if (type === 'objectid') return mongoose.isValidObjectId(id) ? { _id: new mongoose.Types.ObjectId(id) } : null;
+  if (type === 'string') return { _id: id };
+  return null;
+}
+
+async function findCRMUser(userId, projection = {}, requestedType = '') {
   const id = String(userId || '').trim();
   if (!id) return null;
   const users = mongoose.connection.db.collection('users');
   const options = Object.keys(projection || {}).length ? { projection } : undefined;
+  // El cliente de Expedientes conserva el tipo BSON del _id. Es imprescindible
+  // cuando existen datos históricos con el mismo texto como String y ObjectId.
+  const exactSelector = userSelector(id, requestedType);
+  if (exactSelector) return users.findOne(exactSelector, options);
   // El CRM histórico ha usado ambos tipos de _id. Nunca envíes un selector
   // mixto al driver: primero consulta exactamente el valor de la sesión y,
   // únicamente si no existe, usa ObjectId como compatibilidad.
@@ -73,7 +92,7 @@ async function requireHRManager(req, res, next) {
   try {
     const actorId = req.headers['x-crm-user-id'];
     if (!actorId) return res.status(401).json({ error: 'Se requiere una sesión de administrador.' });
-    const actor = await findCRMUser(actorId, { rol: 1, role: 1, estadoCuenta: 1, activo: 1 });
+    const actor = await findCRMUser(actorId, { rol: 1, role: 1, estadoCuenta: 1, activo: 1 }, req.headers['x-crm-user-id-type']);
     const active = actor && (typeof actor.activo === 'boolean' ? actor.activo : actor.estadoCuenta !== 'inactiva');
     const actorRole = String(actor?.rol || actor?.role || '').trim();
     if (!active || actorRole.toLowerCase() !== 'admin') {
@@ -96,7 +115,7 @@ router.use(requireHRManager);
 function publicUser(user) {
   const raw = user.toObject ? user.toObject() : user;
   const { password, tokenPortal, __v, ...safe } = raw;
-  return safe;
+  return { ...safe, idTipo: userIdType(raw) };
 }
 
 function profilePayload(profile) {
@@ -139,7 +158,19 @@ function dateOrUndefined(value) {
 router.get('/', async (req, res) => {
   try {
     const users = await mongoose.connection.db.collection('users').find({}).sort({ nombre: 1, apellido: 1 }).toArray();
-    const ids = users.map(user => String(user._id));
+    // Una versión antigua generó algunos registros sombra: mismo texto de _id,
+    // pero distinto tipo BSON. No se borran aquí; solo mostramos la identidad
+    // con datos reales para evitar editar por accidente la cuenta equivocada.
+    const scoreUser = user => [user.correo, user.nombre, user.apellido, user.password, user.rol, user.role]
+      .reduce((score, value) => score + (String(value || '').trim() ? 1 : 0), 0);
+    const usersById = new Map();
+    users.forEach(user => {
+      const key = String(user._id);
+      const current = usersById.get(key);
+      if (!current || scoreUser(user) > scoreUser(current)) usersById.set(key, user);
+    });
+    const visibleUsers = [...usersById.values()];
+    const ids = visibleUsers.map(user => String(user._id));
     const [profiles, documents] = await Promise.all([
       EmployeeProfile.find({ usuarioId: { $in: ids } }),
       EmployeeDocument.find({ usuarioId: { $in: ids } }).select('-datos').sort({ createdAt: -1 }),
@@ -151,7 +182,7 @@ router.get('/', async (req, res) => {
       if (!docsByUser.has(key)) docsByUser.set(key, []);
       docsByUser.get(key).push(document.toObject());
     });
-    res.json({ empleados: users.map(user => ({
+    res.json({ empleados: visibleUsers.map(user => ({
       usuario: publicUser(user),
       perfil: profileByUser.get(String(user._id)) || {},
       documentos: docsByUser.get(String(user._id)) || [],
@@ -208,9 +239,7 @@ router.get('/:userId', async (req, res) => {
     // esta base conviven _id String y ObjectId; algunos despliegues de Render
     // fallaban con findOne sobre los IDs String, pero find({}) funciona para
     // ambos y el conjunto actual es pequeño.
-    const requestedId = String(req.params.userId || '').trim();
-    const users = await mongoose.connection.db.collection('users').find({}).toArray();
-    const user = users.find(item => String(item._id) === requestedId);
+    const user = await findCRMUser(req.params.userId, {}, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const employeeId = String(user._id);
     let profile = null;
@@ -253,7 +282,7 @@ router.put('/:userId', async (req, res) => {
       if (perfil[field] && typeof perfil[field] === 'object') profileUpdate[field] = perfil[field];
     });
 
-    const existingUser = await findCRMUser(req.params.userId, { _id: 1 });
+    const existingUser = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!existingUser) return res.status(404).json({ error: 'Empleado no encontrado.' });
     await mongoose.connection.db.collection('users').updateOne({ _id: existingUser._id }, { $set: userUpdate });
     const user = await mongoose.connection.db.collection('users').findOne({ _id: existingUser._id }, { projection: { password: 0, tokenPortal: 0 } });
@@ -272,7 +301,7 @@ router.put('/:userId', async (req, res) => {
 
 router.put('/:userId/permisos', async (req, res) => {
   try {
-    const user = await findCRMUser(req.params.userId, { _id: 1, rol: 1 });
+    const user = await findCRMUser(req.params.userId, { _id: 1, rol: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const permissions = Array.isArray(req.body?.permisos)
       ? [...new Set(req.body.permisos.filter(permission => VALID_PERMISSIONS.has(permission)))]
@@ -290,7 +319,7 @@ router.patch('/:userId/cuenta/estado', async (req, res) => {
   try {
     const estado = String(req.body?.estado || '').toLowerCase();
     if (!VALID_ACCOUNT_STATES.has(estado)) return res.status(400).json({ error: 'Estado de cuenta no válido.' });
-    const user = await findCRMUser(req.params.userId, { _id: 1, correo: 1, password: 1 });
+    const user = await findCRMUser(req.params.userId, { _id: 1, correo: 1, password: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     if (estado === 'activa' && !String(user.password || '').trim()) {
       return res.status(400).json({ error: 'Define una contraseña temporal antes de activar la cuenta.' });
@@ -314,7 +343,7 @@ router.post('/:userId/cuenta/password', async (req, res) => {
   try {
     const password = String(req.body?.password || '');
     if (password.length < 10) return res.status(400).json({ error: 'La contraseña debe tener al menos 10 caracteres.' });
-    const user = await findCRMUser(req.params.userId, { _id: 1 });
+    const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     await mongoose.connection.db.collection('users').updateOne({ _id: user._id }, { $set: { password: passwordHash(password), passwordActualizadaEn: new Date() }, $inc: { sessionVersion: 1 } });
     await audit(req, user._id, 'cuenta.password_restablecida', 'Un administrador restableció la contraseña.');
@@ -340,7 +369,7 @@ router.post('/:userId/documentos', async (req, res) => {
     const data = datos.replace(/^data:[^;]+;base64,/, '');
     const size = Buffer.byteLength(data, 'base64');
     if (!Number.isFinite(size) || size > MAX_DOCUMENT_BYTES) return res.status(413).json({ error: 'Cada documento puede pesar hasta 8 MB.' });
-    const user = await findCRMUser(req.params.userId, { _id: 1 });
+    const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const document = await EmployeeDocument.create({ usuarioId: String(user._id), nombre, tipo, contentType, tamanio: size, datos: data });
     await audit(req, user._id, 'documento.agregado', `${tipo || 'Documento'}: ${nombre}`);
@@ -420,7 +449,7 @@ router.post('/:userId/acceso/hikvision/sincronizar', async (req, res) => {
   const config = hikvisionConfig();
   if (!config) return res.status(503).json({ error: 'Hikvision no está configurado en el servidor. Define HIKVISION_ISAPI_URL, HIKVISION_USERNAME y HIKVISION_PASSWORD.' });
   try {
-    const user = await findCRMUser(req.params.userId, { nombre: 1, apellido: 1 });
+    const user = await findCRMUser(req.params.userId, { nombre: 1, apellido: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const profile = await EmployeeProfile.findOne({ usuarioId: String(user._id) });
     const access = { ...(profile?.acceso?.toObject?.() || profile?.acceso || {}), ...(req.body?.acceso || {}) };
@@ -449,7 +478,7 @@ router.post('/:userId/acceso/hikvision/revocar', async (req, res) => {
   const config = hikvisionConfig();
   if (!config) return res.status(503).json({ error: 'Hikvision no está configurado en el servidor.' });
   try {
-    const user = await findCRMUser(req.params.userId, { _id: 1 });
+    const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const profile = await EmployeeProfile.findOne({ usuarioId: String(user._id) });
     const employeeNo = String(profile?.acceso?.employeeNo || user._id);

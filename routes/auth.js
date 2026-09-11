@@ -1,9 +1,41 @@
 const express = require('express');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
 const router = express.Router();
+
+function verificarPasswordUniversal(password, storedPassword) {
+  const stored = String(storedPassword || '');
+  if (!stored || !password) return false;
+
+  // 1. scrypt (empleados.js / server_2)
+  if (stored.startsWith('scrypt$')) {
+    const [, salt, expected] = stored.split('$');
+    if (!salt || !expected) return false;
+    try {
+      const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+      const a = Buffer.from(derived, 'hex');
+      const b = Buffer.from(expected, 'hex');
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 2. bcrypt ($2a$, $2b$, $2y$)
+  if (/^\$2[aby]\$\d+\$/.test(stored)) {
+    try {
+      return bcrypt.compareSync(String(password), stored);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 3. Texto plano histórico
+  return stored === String(password);
+}
 
 // Mapa de roles de naisata_db → roles internos de app-it
 const ROL_MAP = { admin: 'admin', socio: 'dom', user: 'empleado' };
@@ -50,7 +82,7 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Cuenta inactiva' });
     }
 
-    const valido = await bcrypt.compare(password, user.password);
+    const valido = verificarPasswordUniversal(password, user.password);
     if (!valido) {
       console.log(`[LOGIN FALLIDO] Contraseña incorrecta para: ${username}`);
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
