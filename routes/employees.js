@@ -3,10 +3,43 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const EmployeeProfile = require('../models/EmployeeProfile');
 const EmployeeDocument = require('../models/EmployeeDocument');
+const EmployeeAudit = require('../models/EmployeeAudit');
 const { verifyToken, requireRole, verifyApiKey } = require('../middleware/auth');
 
 const router = express.Router();
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
+const CRM_PERMISSIONS = [
+  ['dashboard.ver', 'Panel principal'],
+  ['cotizaciones.ver', 'Ver cotizaciones'], ['cotizaciones.editar', 'Crear y editar cotizaciones'],
+  ['precios.ver', 'Ver tabulador'], ['precios.editar', 'Administrar tabulador'],
+  ['proyectos.ver', 'Ver proyectos'], ['proyectos.editar', 'Administrar proyectos'],
+  ['tareas.ver', 'Ver tareas'], ['tareas.editar', 'Administrar tareas'],
+  ['agenda.ver', 'Ver agenda'], ['agenda.editar', 'Administrar agenda'],
+  ['entregables.ver', 'Ver entregables'], ['entregables.crear', 'Crear entregables'],
+  ['correo.ver', 'Consultar correo'], ['correo.enviar', 'Enviar correo'],
+  ['tracking.ver', 'Ver tracking e inventario'], ['tracking.operar', 'Operar tracking e inventario'],
+  ['finanzas.ver', 'Ver finanzas'], ['finanzas.editar', 'Administrar finanzas'],
+];
+const VALID_PERMISSIONS = new Set(CRM_PERMISSIONS.map(([key]) => key));
+const VALID_ACCOUNT_STATES = new Set(['pendiente', 'activa', 'inactiva', 'suspendida', 'revocada']);
+
+function passwordHash(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `scrypt$${salt}$${hash}`;
+}
+
+function defaultPermissions(role) {
+  if (role === 'admin') return CRM_PERMISSIONS.map(([key]) => key);
+  if (role === 'socio') return ['dashboard.ver', 'cotizaciones.ver', 'cotizaciones.editar', 'precios.ver', 'proyectos.ver', 'proyectos.editar', 'tareas.ver', 'tareas.editar', 'agenda.ver', 'agenda.editar', 'entregables.ver', 'entregables.crear', 'correo.ver', 'correo.enviar', 'tracking.ver', 'tracking.operar'];
+  return ['dashboard.ver', 'tareas.ver', 'entregables.ver'];
+}
+
+async function audit(req, empleadoId, accion, detalle = '', metadatos = {}) {
+  try {
+    await EmployeeAudit.create({ empleadoId: String(empleadoId), actorId: String(req.user?.id || 'sistema'), accion, detalle, metadatos });
+  } catch (error) { console.error('[Expedientes] No se pudo guardar auditoría:', error.message); }
+}
 
 // server_2 define `_id` de users como String, mientras que otras versiones de
 // la app lo crean como ObjectId. Consultamos la colección nativa para no
@@ -68,6 +101,10 @@ function profilePayload(profile) {
   return profile ? profile.toObject() : {};
 }
 
+function cleanEmployee(user) {
+  return publicUser(user || {});
+}
+
 function dateOrUndefined(value) {
   if (!value) return undefined;
   const date = new Date(value);
@@ -99,6 +136,45 @@ router.get('/', async (req, res) => {
   }
 });
 
+router.get('/catalogo/permisos', (req, res) => {
+  res.json({ permisos: CRM_PERMISSIONS.map(([clave, nombre]) => ({ clave, nombre })) });
+});
+
+// Crea la identidad de CRM y el expediente en una misma operación lógica.
+// Por seguridad la cuenta queda pendiente hasta que el administrador la active.
+router.post('/', async (req, res) => {
+  try {
+    const { usuario = {}, perfil = {}, password, crearAcceso = false } = req.body || {};
+    const nombre = String(usuario.nombre || '').trim();
+    const correo = String(usuario.correo || '').trim().toLowerCase();
+    const rol = ['admin', 'socio', 'user'].includes(usuario.rol) ? usuario.rol : 'user';
+    if (!nombre || !correo) return res.status(400).json({ error: 'Nombre y correo son obligatorios.' });
+    if (crearAcceso && String(password || '').length < 10) return res.status(400).json({ error: 'La contraseña temporal debe tener al menos 10 caracteres.' });
+    const exists = await mongoose.connection.db.collection('users').findOne({ correo }, { projection: { _id: 1 } });
+    if (exists) return res.status(409).json({ error: 'Ya existe una cuenta con ese correo.' });
+
+    const userId = new mongoose.Types.ObjectId().toString();
+    const estadoCuenta = crearAcceso ? 'pendiente' : 'inactiva';
+    const permissions = Array.isArray(usuario.permisosCrm)
+      ? usuario.permisosCrm.filter(permission => VALID_PERMISSIONS.has(permission))
+      : defaultPermissions(rol);
+    const user = {
+      _id: userId, nombre, apellido: String(usuario.apellido || '').trim(), correo,
+      telefono: String(usuario.telefono || '').trim(), rol, estadoCuenta,
+      password: crearAcceso ? passwordHash(password) : '', permisosCrm: permissions,
+      sessionVersion: 0, accesoCrm: { estado: estadoCuenta, actualizadoEn: new Date(), actualizadoPor: String(req.user.id) },
+      creadoEn: new Date(), creadoPor: String(req.user.id),
+    };
+    await mongoose.connection.db.collection('users').insertOne(user);
+    const profile = await EmployeeProfile.create({ ...profile, usuarioId: userId });
+    await audit(req, userId, 'empleado.creado', `Expediente creado para ${correo}`, { crearAcceso });
+    res.status(201).json({ usuario: cleanEmployee(user), perfil: profilePayload(profile), mensaje: crearAcceso ? 'Expediente creado; activa la cuenta cuando el empleado deba ingresar.' : 'Expediente creado sin acceso al CRM.' });
+  } catch (error) {
+    console.error('[Expedientes] Error creando empleado:', error.message);
+    res.status(500).json({ error: 'No se pudo crear el empleado.' });
+  }
+});
+
 router.get('/:userId', async (req, res) => {
   try {
     const [user, profile, documents] = await Promise.all([
@@ -109,7 +185,8 @@ router.get('/:userId', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     res.json({ usuario: publicUser(user), perfil: profilePayload(profile), documentos });
   } catch (error) {
-    res.status(400).json({ error: 'Identificador de empleado no válido.' });
+    console.error('[Expedientes] Error cargando expediente:', req.params.userId, error.message);
+    res.status(500).json({ error: 'No se pudo cargar el expediente. Revisa la conexión de server_a con MongoDB.' });
   }
 });
 
@@ -140,9 +217,73 @@ router.put('/:userId', async (req, res) => {
       { $set: profileUpdate, $setOnInsert: { usuarioId: String(user._id) } },
       { new: true, upsert: true, setDefaultsOnInsert: true },
     );
+    await audit(req, user._id, 'expediente.actualizado', 'Se actualizaron datos del perfil.');
     res.json({ usuario: publicUser(user), perfil: profilePayload(profile) });
   } catch (error) {
     res.status(400).json({ error: `No se pudo guardar el expediente: ${error.message}` });
+  }
+});
+
+router.put('/:userId/permisos', async (req, res) => {
+  try {
+    const user = await findCRMUser(req.params.userId, { _id: 1, rol: 1 });
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    const permissions = Array.isArray(req.body?.permisos)
+      ? [...new Set(req.body.permisos.filter(permission => VALID_PERMISSIONS.has(permission)))]
+      : [];
+    await mongoose.connection.db.collection('users').updateOne({ _id: user._id }, { $set: { permisosCrm: permissions, permisosActualizadosEn: new Date(), permisosActualizadosPor: String(req.user.id) } });
+    await audit(req, user._id, 'cuenta.permisos_actualizados', `${permissions.length} permisos asignados.`, { permisos: permissions });
+    res.json({ permisos: permissions });
+  } catch (error) {
+    console.error('[Expedientes] Error guardando permisos:', error.message);
+    res.status(500).json({ error: 'No se pudieron guardar los permisos.' });
+  }
+});
+
+router.patch('/:userId/cuenta/estado', async (req, res) => {
+  try {
+    const estado = String(req.body?.estado || '').toLowerCase();
+    if (!VALID_ACCOUNT_STATES.has(estado)) return res.status(400).json({ error: 'Estado de cuenta no válido.' });
+    const user = await findCRMUser(req.params.userId, { _id: 1, correo: 1, password: 1 });
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    if (estado === 'activa' && !String(user.password || '').trim()) {
+      return res.status(400).json({ error: 'Define una contraseña temporal antes de activar la cuenta.' });
+    }
+    const update = {
+      estadoCuenta: estado,
+      'accesoCrm.estado': estado,
+      'accesoCrm.actualizadoEn': new Date(),
+      'accesoCrm.actualizadoPor': String(req.user.id),
+    };
+    await mongoose.connection.db.collection('users').updateOne({ _id: user._id }, { $set: update, $inc: { sessionVersion: 1 } });
+    await audit(req, user._id, `cuenta.${estado}`, `Acceso CRM marcado como ${estado}.`);
+    res.json({ estado, mensaje: estado === 'activa' ? 'Cuenta activada.' : 'Cuenta suspendida/revocada; la próxima validación cerrará la sesión del empleado.' });
+  } catch (error) {
+    console.error('[Expedientes] Error cambiando acceso:', error.message);
+    res.status(500).json({ error: 'No se pudo actualizar el acceso CRM.' });
+  }
+});
+
+router.post('/:userId/cuenta/password', async (req, res) => {
+  try {
+    const password = String(req.body?.password || '');
+    if (password.length < 10) return res.status(400).json({ error: 'La contraseña debe tener al menos 10 caracteres.' });
+    const user = await findCRMUser(req.params.userId, { _id: 1 });
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    await mongoose.connection.db.collection('users').updateOne({ _id: user._id }, { $set: { password: passwordHash(password), passwordActualizadaEn: new Date() }, $inc: { sessionVersion: 1 } });
+    await audit(req, user._id, 'cuenta.password_restablecida', 'Un administrador restableció la contraseña.');
+    res.json({ success: true, mensaje: 'Contraseña actualizada.' });
+  } catch (error) {
+    res.status(500).json({ error: 'No se pudo restablecer la contraseña.' });
+  }
+});
+
+router.get('/:userId/auditoria', async (req, res) => {
+  try {
+    const events = await EmployeeAudit.find({ empleadoId: String(req.params.userId) }).sort({ createdAt: -1 }).limit(100).lean();
+    res.json({ eventos: events });
+  } catch (error) {
+    res.status(500).json({ error: 'No se pudo cargar la auditoría.' });
   }
 });
 
@@ -156,6 +297,7 @@ router.post('/:userId/documentos', async (req, res) => {
     const user = await findCRMUser(req.params.userId, { _id: 1 });
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const document = await EmployeeDocument.create({ usuarioId: String(user._id), nombre, tipo, contentType, tamanio: size, datos: data });
+    await audit(req, user._id, 'documento.agregado', `${tipo || 'Documento'}: ${nombre}`);
     res.status(201).json(document.toObject({ transform: (_, value) => { delete value.datos; return value; } }));
   } catch (error) {
     res.status(400).json({ error: 'No se pudo subir el documento.' });
@@ -178,6 +320,7 @@ router.delete('/:userId/documentos/:documentId', async (req, res) => {
   try {
     const document = await EmployeeDocument.findOneAndDelete({ _id: req.params.documentId, usuarioId: String(req.params.userId) });
     if (!document) return res.status(404).json({ error: 'Documento no encontrado.' });
+    await audit(req, req.params.userId, 'documento.eliminado', `Documento eliminado: ${document.nombre}`);
     res.json({ success: true });
   } catch (error) {
     res.status(400).json({ error: 'No se pudo eliminar el documento.' });
@@ -253,6 +396,25 @@ router.post('/:userId/acceso/hikvision/sincronizar', async (req, res) => {
   } catch (error) {
     await EmployeeProfile.findOneAndUpdate({ usuarioId: String(req.params.userId) }, { $set: { 'acceso.estado': 'Error de sincronización', 'acceso.ultimoResultado': error.message, 'acceso.ultimaSincronizacion': new Date() } }).catch(() => {});
     res.status(502).json({ error: error.message || 'No fue posible comunicar con Hikvision.' });
+  }
+});
+
+router.post('/:userId/acceso/hikvision/revocar', async (req, res) => {
+  const config = hikvisionConfig();
+  if (!config) return res.status(503).json({ error: 'Hikvision no está configurado en el servidor.' });
+  try {
+    const user = await findCRMUser(req.params.userId, { _id: 1 });
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    const profile = await EmployeeProfile.findOne({ usuarioId: String(user._id) });
+    const employeeNo = String(profile?.acceso?.employeeNo || user._id);
+    const response = await hikvisionPost(config, '/ISAPI/AccessControl/CardInfo/Delete?format=json', { CardInfoDelCond: { EmployeeNoList: [{ employeeNo }] } });
+    const body = await response.text();
+    if (!response.ok) throw new Error(`El controlador rechazó la baja (${response.status}): ${body.slice(0, 220)}`);
+    const saved = await EmployeeProfile.findOneAndUpdate({ usuarioId: String(user._id) }, { $set: { 'acceso.estado': 'Revocada en Hikvision', 'acceso.ultimaSincronizacion': new Date(), 'acceso.ultimoResultado': 'Tarjeta revocada' } }, { new: true });
+    await audit(req, user._id, 'hikvision.revocado', 'Tarjeta revocada del control de acceso.');
+    res.json({ success: true, perfil: profilePayload(saved) });
+  } catch (error) {
+    res.status(502).json({ error: error.message || 'No fue posible revocar el acceso en Hikvision.' });
   }
 });
 
