@@ -244,7 +244,10 @@ router.get('/:userId', async (req, res) => {
     let profile = null;
     let documents = [];
     const warnings = [];
-    try { profile = await EmployeeProfile.findOne({ usuarioId: employeeId }).lean(); }
+    try { 
+      const profiles = await EmployeeProfile.find({ usuarioId: employeeId }).limit(1).lean(); 
+      profile = profiles[0] || null;
+    }
     catch (error) { warnings.push('No se pudo cargar el perfil complementario.'); console.error('[Expedientes] Perfil:', error.message); }
     try { documents = await EmployeeDocument.find({ usuarioId: employeeId }).select('-datos').sort({ createdAt: -1 }).lean(); }
     catch (error) { warnings.push('No se pudieron cargar los documentos.'); console.error('[Expedientes] Documentos:', error.message); }
@@ -381,7 +384,8 @@ router.post('/:userId/documentos', async (req, res) => {
 
 router.get('/:userId/documentos/:documentId/archivo', async (req, res) => {
   try {
-    const document = await EmployeeDocument.findOne({ _id: req.params.documentId, usuarioId: String(req.params.userId) }).select('+datos');
+    const docs = await EmployeeDocument.find({ _id: req.params.documentId, usuarioId: String(req.params.userId) }).select('+datos').limit(1);
+    const document = docs[0] || null;
     if (!document) return res.status(404).json({ error: 'Documento no encontrado.' });
     res.type(document.contentType || 'application/octet-stream');
     res.set('Content-Disposition', `inline; filename="${String(document.nombre).replace(/[\r\n"]/g, '')}"`);
@@ -451,7 +455,8 @@ router.post('/:userId/acceso/hikvision/sincronizar', async (req, res) => {
   try {
     const user = await findCRMUser(req.params.userId, { nombre: 1, apellido: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    const profile = await EmployeeProfile.findOne({ usuarioId: String(user._id) });
+    const profiles = await EmployeeProfile.find({ usuarioId: String(user._id) }).limit(1);
+    const profile = profiles[0] || null;
     const access = { ...(profile?.acceso?.toObject?.() || profile?.acceso || {}), ...(req.body?.acceso || {}) };
     const employeeNo = String(access.employeeNo || user._id);
     const cardNo = String(access.tarjetaNumero || '').trim();
@@ -480,7 +485,8 @@ router.post('/:userId/acceso/hikvision/revocar', async (req, res) => {
   try {
     const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    const profile = await EmployeeProfile.findOne({ usuarioId: String(user._id) });
+    const profiles = await EmployeeProfile.find({ usuarioId: String(user._id) }).limit(1);
+    const profile = profiles[0] || null;
     const employeeNo = String(profile?.acceso?.employeeNo || user._id);
     const response = await hikvisionPost(config, '/ISAPI/AccessControl/CardInfo/Delete?format=json', { CardInfoDelCond: { EmployeeNoList: [{ employeeNo }] } });
     const body = await response.text();
