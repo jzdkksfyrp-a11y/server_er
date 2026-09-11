@@ -238,23 +238,34 @@ router.get('/:userId', async (req, res) => {
     // esta base conviven _id String y ObjectId; algunos despliegues de Render
     // fallaban con findOne sobre los IDs String, pero find({}) funciona para
     // ambos y el conjunto actual es pequeño.
+    const t1 = Date.now();
     const user = await findCRMUser(req.params.userId, {}, req.query.idType);
+    const t2 = Date.now();
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const employeeId = String(user._id);
     let profile = null;
     let documents = [];
     const warnings = [];
+    const t3 = Date.now();
     try { 
       const profiles = await EmployeeProfile.find({ usuarioId: employeeId }).limit(1).lean(); 
       profile = profiles[0] || null;
     }
     catch (error) { warnings.push('No se pudo cargar el perfil complementario.'); console.error('[Expedientes] Perfil:', error.message); }
+    const t4 = Date.now();
     try { documents = await EmployeeDocument.find({ usuarioId: employeeId }).select('-datos').sort({ createdAt: -1 }).lean(); }
     catch (error) { warnings.push('No se pudieron cargar los documentos.'); console.error('[Expedientes] Documentos:', error.message); }
+    const t5 = Date.now();
     // El perfil nuevo tiene prioridad; los campos heredados completan solo lo
     // que todavía no se haya capturado en employee_profiles.
     const perfil = { ...legacyProfileValues(user), ...(profile || {}) };
     res.json({
+      _debug: {
+        total: Date.now() - t0,
+        findUser: t2 - t1,
+        findProfile: t4 - t3,
+        findDocs: t5 - t4,
+      },
       usuario: publicUser(user),
       perfil,
       documentos: documents,
