@@ -63,17 +63,29 @@ async function findCRMUser(userId, projection = {}, requestedType = '') {
   const id = String(userId || '').trim();
   if (!id) return null;
   const users = mongoose.connection.db.collection('users');
-  const options = Object.keys(projection || {}).length ? { projection } : undefined;
+  
+  // Bugfix: Native driver hangs on find({ _id: "string" }). Usamos aggregate.
+  const aggOptions = Object.keys(projection || {}).length ? { $project: projection } : null;
+  
+  const executeQuery = async (matchExpr) => {
+    const pipeline = [{ $match: matchExpr }];
+    if (aggOptions) pipeline.push(aggOptions);
+    pipeline.push({ $limit: 1 });
+    const result = await users.aggregate(pipeline).toArray();
+    return result.length ? result[0] : null;
+  };
+
   const exactSelector = userSelector(id, requestedType);
   if (exactSelector) {
-    const exactList = await users.find(exactSelector, options).limit(1).toArray();
-    if (exactList.length) return exactList[0];
+    const exactMatch = await executeQuery(exactSelector);
+    if (exactMatch) return exactMatch;
   }
-  let list = await users.find({ _id: id }, options).limit(1).toArray();
-  if (!list.length && mongoose.isValidObjectId(id)) {
-    list = await users.find({ _id: new mongoose.Types.ObjectId(id) }, options).limit(1).toArray();
+  
+  let match = await executeQuery({ _id: id });
+  if (!match && mongoose.isValidObjectId(id)) {
+    match = await executeQuery({ _id: new mongoose.Types.ObjectId(id) });
   }
-  return list[0] || null;
+  return match;
 }
 
 // El CRM de escritorio aún no emite JWT. Se mantiene una ruta de transición
@@ -159,11 +171,7 @@ router.get('/', async (req, res) => {
     // La lista solo necesita un resumen. Los PDFs/imágenes históricos pueden
     // ser muy pesados y se consultan únicamente al abrir ese expediente.
     const users = await mongoose.connection.db.collection('users').find({}, {
-      projection: {
-        _id: 1, nombre: 1, apellido: 1, correo: 1, telefono: 1, rol: 1,
-        role: 1, estadoCuenta: 1, accesoCrm: 1, permisosCrm: 1,
-        fechaIngreso: 1, nss: 1, rfc: 1, numeroEmpleado: 1, categoria: 1,
-      },
+      projection: { fotoPerfil: 0, firma: 0, password: 0, documentos: 0 },
     }).sort({ nombre: 1, apellido: 1 }).toArray();
     // Una versión antigua generó algunos registros sombra: mismo texto de _id,
     // pero distinto tipo BSON. No se borran aquí; solo mostramos la identidad
@@ -231,6 +239,7 @@ router.post('/', async (req, res) => {
 });
 
 router.get('/:userId', async (req, res) => {
+  const t0 = Date.now();
   try {
     // Leer al usuario primero. Un expediente o documento legado defectuoso no
     // debe impedir abrir y editar la ficha básica de un empleado existente.
@@ -239,7 +248,7 @@ router.get('/:userId', async (req, res) => {
     // fallaban con findOne sobre los IDs String, pero find({}) funciona para
     // ambos y el conjunto actual es pequeño.
     const t1 = Date.now();
-    const user = await findCRMUser(req.params.userId, {}, req.query.idType);
+    const user = await findCRMUser(req.params.userId, { fotoPerfil: 0, firma: 0, password: 0 }, req.query.idType);
     const t2 = Date.now();
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
     const employeeId = String(user._id);
