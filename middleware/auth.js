@@ -1,7 +1,8 @@
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
 // Valida el JWT que se genera al hacer login (lo usa el frontend)
-function verifyToken(req, res, next) {
+async function verifyToken(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Token no proporcionado' });
@@ -9,6 +10,16 @@ function verifyToken(req, res, next) {
   const token = header.split(' ')[1];
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
+    // Una cuenta inactiva deja de poder usar inmediatamente las rutas protegidas.
+    const id = String(req.user.id || '');
+    const ids = [id];
+    if (mongoose.isValidObjectId(id)) ids.push(new mongoose.Types.ObjectId(id));
+    const user = await mongoose.connection.db.collection('users').find({ _id: { $in: ids } }, { projection: { activo: 1, estadoCuenta: 1, sessionVersion: 1 } }).limit(1).next();
+    const active = user && (typeof user.activo === 'boolean' ? user.activo : String(user.estadoCuenta || '').toLowerCase() === 'activa');
+    if (!active) return res.status(401).json({ error: 'Cuenta inactiva.' });
+    if (req.user.sessionVersion !== undefined && Number(user.sessionVersion || 0) !== Number(req.user.sessionVersion)) {
+      return res.status(401).json({ error: 'La sesión fue revocada.' });
+    }
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Token invalido o expirado' });

@@ -94,7 +94,7 @@ router.post('/login', async (req, res) => {
     const rolNormalizado = ROL_MAP[user.rol] || 'empleado';
 
     const token = jwt.sign(
-      { id: user._id, username: user.correo || user.username, rol: rolNormalizado, nombre: user.nombre },
+      { id: user._id, username: user.correo || user.username, rol: rolNormalizado, nombre: user.nombre, sessionVersion: Number(user.sessionVersion || 0) },
       process.env.JWT_SECRET,
       { expiresIn: '12h' }
     );

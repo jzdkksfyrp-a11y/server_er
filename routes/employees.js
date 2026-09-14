@@ -4,10 +4,12 @@ const mongoose = require('mongoose');
 const EmployeeProfile = require('../models/EmployeeProfile');
 const EmployeeDocument = require('../models/EmployeeDocument');
 const EmployeeAudit = require('../models/EmployeeAudit');
+const EmployeeEquipment = require('../models/EmployeeEquipment');
 const { verifyToken, requireRole, verifyApiKey } = require('../middleware/auth');
 
 const router = express.Router();
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
+const ALLOWED_DOCUMENT_EXTENSIONS = new Set(['pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'doc', 'docx', 'xls', 'xlsx']);
 // Únicamente módulos visibles en el menú lateral de proyectos.html. No se
 // exponen permisos internos o de acciones individuales en este expediente.
 const CRM_PERMISSIONS = [
@@ -21,6 +23,7 @@ const CRM_PERMISSIONS = [
   ['modulo.appTareas', 'App Tareas'],
   ['modulo.agenda', 'Agenda inteligente'],
   ['modulo.finanzas', 'Finanzas'],
+  ['modulo.gps', 'GPS y Flotilla'],
 ];
 const VALID_PERMISSIONS = new Set(CRM_PERMISSIONS.map(([key]) => key));
 const VALID_ACCOUNT_STATES = new Set(['pendiente', 'activa', 'inactiva', 'suspendida', 'revocada']);
@@ -166,6 +169,11 @@ function dateOrUndefined(value) {
   return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
+function allowedDocumentName(name) {
+  const extension = String(name || '').trim().split('.').pop().toLowerCase();
+  return ALLOWED_DOCUMENT_EXTENSIONS.has(extension);
+}
+
 router.get('/', async (req, res) => {
   try {
     // La lista solo necesita un resumen. Los PDFs/imágenes históricos pueden
@@ -176,8 +184,15 @@ router.get('/', async (req, res) => {
     // Una versión antigua generó algunos registros sombra: mismo texto de _id,
     // pero distinto tipo BSON. No se borran aquí; solo mostramos la identidad
     // con datos reales para evitar editar por accidente la cuenta equivocada.
-    const scoreUser = user => [user.correo, user.nombre, user.apellido, user.password, user.rol, user.role]
-      .reduce((score, value) => score + (String(value || '').trim() ? 1 : 0), 0);
+    const scoreUser = user => {
+      let score = [user.correo, user.nombre, user.apellido, user.password, user.rol, user.role]
+        .reduce((s, value) => s + (String(value || '').trim() ? 1 : 0), 0);
+      // Fuerte preferencia a registros que han tenido actividad reciente para no mostrar "fantasmas" viejos
+      if (user.permisosActualizadosEn) score += 100;
+      if (user.passwordActualizadaEn) score += 50;
+      if (user.accesoCrm?.actualizadoEn) score += 50;
+      return score;
+    };
     const usersById = new Map();
     users.forEach(user => {
       const key = String(user._id);
@@ -223,7 +238,7 @@ router.post('/', async (req, res) => {
       : defaultPermissions(rol);
     const user = {
       _id: userId, nombre, apellido: String(usuario.apellido || '').trim(), correo,
-      telefono: String(usuario.telefono || '').trim(), rol, estadoCuenta,
+      telefono: String(usuario.telefono || '').trim(), rol, estadoCuenta, activo: false,
       password: crearAcceso ? passwordHash(password) : '', permisosCrm: permissions,
       sessionVersion: 0, accesoCrm: { estado: estadoCuenta, actualizadoEn: new Date(), actualizadoPor: String(req.user.id) },
       creadoEn: new Date(), creadoPor: String(req.user.id),
@@ -254,6 +269,7 @@ router.get('/:userId', async (req, res) => {
     const employeeId = String(user._id);
     let profile = null;
     let documents = [];
+    let equipment = [];
     const warnings = [];
     const t3 = Date.now();
     try { 
@@ -264,6 +280,8 @@ router.get('/:userId', async (req, res) => {
     const t4 = Date.now();
     try { documents = await EmployeeDocument.find({ usuarioId: employeeId }).select('-datos').sort({ createdAt: -1 }).lean(); }
     catch (error) { warnings.push('No se pudieron cargar los documentos.'); console.error('[Expedientes] Documentos:', error.message); }
+    try { equipment = await EmployeeEquipment.find({ usuarioId: employeeId }).sort({ createdAt: -1 }).lean(); }
+    catch (error) { warnings.push('No se pudo cargar el equipo asignado.'); console.error('[Expedientes] Equipo:', error.message); }
     const t5 = Date.now();
     // El perfil nuevo tiene prioridad; los campos heredados completan solo lo
     // que todavía no se haya capturado en employee_profiles.
@@ -279,6 +297,7 @@ router.get('/:userId', async (req, res) => {
       perfil,
       documentos: documents,
       documentosLegacy: legacyDocuments(user),
+      equipo: equipment,
       warnings,
     });
   } catch (error) {
@@ -306,7 +325,23 @@ router.put('/:userId', async (req, res) => {
 
     const existingUser = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!existingUser) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    await mongoose.connection.db.collection('users').updateOne({ _id: existingUser._id }, { $set: userUpdate });
+    if (Object.prototype.hasOwnProperty.call(userUpdate, 'estadoCuenta')) {
+      const estado = String(userUpdate.estadoCuenta || '').toLowerCase();
+      if (!VALID_ACCOUNT_STATES.has(estado)) return res.status(400).json({ error: 'Estado de cuenta no válido.' });
+      const accountUser = await findCRMUser(req.params.userId, { _id: 1, password: 1, estadoCuenta: 1, accesoCrm: 1 }, req.query.idType);
+      const previousState = String(accountUser?.estadoCuenta || accountUser?.accesoCrm?.estado || 'activa').toLowerCase();
+      if (estado === 'activa' && previousState !== 'activa' && !String(accountUser?.password || '').trim()) {
+        return res.status(400).json({ error: 'Define una contraseña temporal antes de activar la cuenta.' });
+      }
+      userUpdate.estadoCuenta = estado;
+      userUpdate.activo = estado === 'activa';
+      userUpdate['accesoCrm.estado'] = estado;
+      userUpdate['accesoCrm.actualizadoEn'] = new Date();
+      userUpdate['accesoCrm.actualizadoPor'] = String(req.user.id);
+    }
+    const userOperation = { $set: userUpdate };
+    if (Object.prototype.hasOwnProperty.call(userUpdate, 'estadoCuenta')) userOperation.$inc = { sessionVersion: 1 };
+    await mongoose.connection.db.collection('users').updateOne({ _id: existingUser._id }, userOperation);
     const userList = await mongoose.connection.db.collection('users').find({ _id: existingUser._id }, { projection: { password: 0, tokenPortal: 0 } }).limit(1).toArray();
     const user = userList[0];
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
@@ -349,6 +384,7 @@ router.patch('/:userId/cuenta/estado', async (req, res) => {
     }
     const update = {
       estadoCuenta: estado,
+      activo: estado === 'activa',
       'accesoCrm.estado': estado,
       'accesoCrm.actualizadoEn': new Date(),
       'accesoCrm.actualizadoPor': String(req.user.id),
@@ -389,6 +425,7 @@ router.post('/:userId/documentos', async (req, res) => {
   try {
     const { nombre, tipo, contentType, datos } = req.body || {};
     if (!nombre || !datos || typeof datos !== 'string') return res.status(400).json({ error: 'Nombre y contenido del documento son obligatorios.' });
+    if (!allowedDocumentName(nombre)) return res.status(400).json({ error: 'Solo se permiten PDF, imágenes y documentos de Office.' });
     const data = datos.replace(/^data:[^;]+;base64,/, '');
     const size = Buffer.byteLength(data, 'base64');
     if (!Number.isFinite(size) || size > MAX_DOCUMENT_BYTES) return res.status(413).json({ error: 'Cada documento puede pesar hasta 8 MB.' });
@@ -398,7 +435,8 @@ router.post('/:userId/documentos', async (req, res) => {
     await audit(req, user._id, 'documento.agregado', `${tipo || 'Documento'}: ${nombre}`);
     res.status(201).json(document.toObject({ transform: (_, value) => { delete value.datos; return value; } }));
   } catch (error) {
-    res.status(400).json({ error: 'No se pudo subir el documento.' });
+    console.error('[Expedientes] Error subiendo documento:', error.message);
+    res.status(400).json({ error: `No se pudo subir el documento: ${error.message}` });
   }
 });
 
@@ -423,6 +461,54 @@ router.delete('/:userId/documentos/:documentId', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(400).json({ error: 'No se pudo eliminar el documento.' });
+  }
+});
+
+router.get('/:userId/equipo', async (req, res) => {
+  try {
+    const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    const equipment = await EmployeeEquipment.find({ usuarioId: String(user._id) }).sort({ createdAt: -1 }).lean();
+    res.json({ equipo: equipment });
+  } catch (error) {
+    res.status(500).json({ error: 'No se pudo cargar el equipo asignado.' });
+  }
+});
+
+router.post('/:userId/equipo', async (req, res) => {
+  try {
+    const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    const tipo = String(req.body?.tipo || '');
+    const nombre = String(req.body?.nombre || '').trim();
+    if (!['Herramienta', 'Equipo personal'].includes(tipo) || !nombre) return res.status(400).json({ error: 'Tipo y nombre del equipo son obligatorios.' });
+    const equipment = await EmployeeEquipment.create({
+      usuarioId: String(user._id), tipo, nombre,
+      numeroSerie: String(req.body?.numeroSerie || '').trim(), notas: String(req.body?.notas || '').trim(),
+    });
+    await audit(req, user._id, 'equipo.asignado', `${tipo}: ${nombre}`, { equipoId: String(equipment._id) });
+    res.status(201).json(equipment);
+  } catch (error) {
+    console.error('[Expedientes] Error asignando equipo:', error.message);
+    res.status(400).json({ error: 'No se pudo guardar el equipo.' });
+  }
+});
+
+router.patch('/:userId/equipo/:equipmentId', async (req, res) => {
+  try {
+    const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
+    if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
+    const estado = String(req.body?.estado || '');
+    if (!['Asignado', 'Devuelto', 'Faltante', 'Baja'].includes(estado)) return res.status(400).json({ error: 'Estado de equipo no válido.' });
+    const set = { estado };
+    if (estado === 'Devuelto') set.fechaDevolucion = new Date();
+    if (estado === 'Asignado') set.fechaDevolucion = null;
+    const equipment = await EmployeeEquipment.findOneAndUpdate({ _id: req.params.equipmentId, usuarioId: String(user._id) }, { $set: set }, { new: true });
+    if (!equipment) return res.status(404).json({ error: 'Equipo no encontrado.' });
+    await audit(req, user._id, 'equipo.estado_actualizado', `${equipment.nombre}: ${estado}`, { equipoId: String(equipment._id) });
+    res.json(equipment);
+  } catch (error) {
+    res.status(400).json({ error: 'No se pudo actualizar el estado del equipo.' });
   }
 });
 
