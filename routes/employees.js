@@ -244,7 +244,7 @@ router.post('/', async (req, res) => {
       creadoEn: new Date(), creadoPor: String(req.user.id),
     };
     await mongoose.connection.db.collection('users').insertOne(user);
-    const profile = await EmployeeProfile.create({ ...profile, usuarioId: userId });
+    const profile = await EmployeeProfile.create({ ...perfil, usuarioId: userId });
     await audit(req, userId, 'empleado.creado', `Expediente creado para ${correo}`, { crearAcceso });
     res.status(201).json({ usuario: cleanEmployee(user), perfil: profilePayload(profile), mensaje: crearAcceso ? 'Expediente creado; activa la cuenta cuando el empleado deba ingresar.' : 'Expediente creado sin acceso al CRM.' });
   } catch (error) {
@@ -319,9 +319,18 @@ router.put('/:userId', async (req, res) => {
     ['fechaIngreso', 'fechaNacimiento'].forEach(field => {
       if (Object.prototype.hasOwnProperty.call(perfil, field)) profileUpdate[field] = dateOrUndefined(perfil[field]) || null;
     });
-    ['contactoEmergencia', 'banco', 'acceso'].forEach(field => {
+    ['contactoEmergencia', 'banco'].forEach(field => {
       if (perfil[field] && typeof perfil[field] === 'object') profileUpdate[field] = perfil[field];
     });
+    // 'acceso' NO se reemplaza completo: el formulario general solo conoce
+    // tarjetaNumero/employeeNo, pero el subdocumento también guarda estado/
+    // ultimaSincronizacion/ultimoResultado que llena la sincronización con
+    // Hikvision. Si se hiciera $set: { acceso: perfil.acceso }, cada vez que
+    // se guardara el expediente general se borraría ese historial de acceso.
+    if (perfil.acceso && typeof perfil.acceso === 'object') {
+      if (Object.prototype.hasOwnProperty.call(perfil.acceso, 'tarjetaNumero')) profileUpdate['acceso.tarjetaNumero'] = perfil.acceso.tarjetaNumero;
+      if (Object.prototype.hasOwnProperty.call(perfil.acceso, 'employeeNo')) profileUpdate['acceso.employeeNo'] = perfil.acceso.employeeNo;
+    }
 
     const existingUser = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!existingUser) return res.status(404).json({ error: 'Empleado no encontrado.' });
