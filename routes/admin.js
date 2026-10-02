@@ -8,7 +8,7 @@ const { adminOrApiKey } = require('../middleware/auth');
 const { optimizarCortes } = require('../utils/cableOptimizer');
 const { sendPushNotification } = require('./push');
 const {
-  ORIGEN, ROLES, PASSWORD_MIN, FILTRO_APP_IT,
+  ORIGEN, ROLES, MSG_PIN, FILTRO_APP_IT, esPinValido,
   normalizarUsername, validarNuevoUsuario, existeIdentidad,
 } = require('../utils/usuariosAppIt');
 
@@ -83,9 +83,7 @@ router.put('/users/:id', async (req, res) => {
     if (nombre) updateData.nombre = String(nombre).trim().slice(0, 100);
     if (rol) updateData.rol = rol;
     if (password) {
-      if (typeof password !== 'string' || password.length < PASSWORD_MIN) {
-        return res.status(400).json({ error: `La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.` });
-      }
+      if (!esPinValido(password)) return res.status(400).json({ error: MSG_PIN });
       updateData.password = await bcrypt.hash(password, 10);
     }
     const user = await User.findOneAndUpdate(

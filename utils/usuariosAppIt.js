@@ -7,7 +7,9 @@ const User = require('../models/User');
 // (usernameKey) sobre la que hay un índice único.
 const ORIGEN = 'app-it';
 const ROLES = ['empleado', 'dom', 'admin'];
-const PASSWORD_MIN = 8;
+// La contraseña de los usuarios de app-it es un NIP de exactamente 4 números
+const PIN_RE = /^\d{4}$/;
+const MSG_PIN = 'La contraseña debe ser un NIP de exactamente 4 números.';
 const USERNAME_RE = /^[a-z0-9][a-z0-9._@-]{2,49}$/;
 
 // Usuarios creados por app-it ANTES de existir el campo "origen":
@@ -26,15 +28,17 @@ function normalizarUsername(valor) {
   return String(valor == null ? '' : valor).trim().toLowerCase();
 }
 
+function esPinValido(valor) {
+  return typeof valor === 'string' && PIN_RE.test(valor);
+}
+
 // Devuelve un mensaje de error (string) o null si todo está bien.
 function validarNuevoUsuario({ username, password, nombre, rol }) {
   if (!nombre || nombre.length > 100) return 'El nombre es obligatorio (máximo 100 caracteres).';
   if (!USERNAME_RE.test(username)) {
     return 'El usuario debe tener de 3 a 50 caracteres: letras, números, punto, guion, guion bajo o @, sin espacios.';
   }
-  if (typeof password !== 'string' || password.length < PASSWORD_MIN) {
-    return `La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.`;
-  }
+  if (!esPinValido(password)) return MSG_PIN;
   if (!ROLES.includes(rol)) return 'Rol invalido';
   return null;
 }
@@ -88,6 +92,6 @@ async function prepararUsuariosAppIt() {
 }
 
 module.exports = {
-  ORIGEN, ROLES, PASSWORD_MIN, FILTRO_APP_IT, FILTRO_LEGACY,
+  ORIGEN, ROLES, MSG_PIN, FILTRO_APP_IT, esPinValido, FILTRO_LEGACY,
   normalizarUsername, validarNuevoUsuario, existeIdentidad, prepararUsuariosAppIt,
 };
