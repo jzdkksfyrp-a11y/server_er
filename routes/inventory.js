@@ -115,8 +115,9 @@ router.put('/:id', async (req, res) => {
       bobina.folio = folio;
     }
 
+    const usado = bobina.metrosIniciales - bobina.metrosRestantes;
     bobina.metrosIniciales = metrosIniciales || bobina.metrosIniciales;
-    bobina.metrosRestantes = bobina.metrosIniciales; // Reset
+    bobina.metrosRestantes = Math.max(0, bobina.metrosIniciales - usado);
     await bobina.save();
     res.json(bobina);
   } catch (err) {

@@ -10,6 +10,25 @@ const User = require('../models/User'); // Need User to find admins
 const router = express.Router();
 router.use(verifyToken);
 
+// Un empleado solo puede tocar tareas asignadas a él
+router.param('id', async (req, res, next, id) => {
+  if (req.user.rol !== 'empleado') return next();
+  try {
+    const t = await Task.findById(id).select('asignadoA');
+    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (String(t.asignadoA) !== String(req.user.id)) return res.status(403).json({ error: 'Esta tarea no está asignada a ti' });
+    next();
+  } catch (e) { res.status(400).json({ error: 'ID inválido' }); }
+});
+
+const bloqueaExtras = (req, t) => req.user.rol === 'empleado' && !t.permitirExtras && !t.creadoPorEmpleado;
+async function avisarAdmins(title, body, taskId) {
+  try {
+    const admins = await User.find({ rol: { $in: ['admin', 'socio', 'dom'] } });
+    for (const a of admins) sendPushNotification(a._id, { title, body, url: `/?id=${taskId}` });
+  } catch (e) { console.error('push admins:', e.message); }
+}
+
 // Lista de tareas: el empleado solo ve las suyas (hasta las 9pm si están terminadas); admin y dom ven activas
 router.get('/', async (req, res) => {
   let filtro = {};
@@ -104,7 +123,7 @@ router.post('/:id/reports', async (req, res) => {
 
   // Notificar a admins/dom
   try {
-    const admins = await User.find({ rol: { $in: ['admin', 'socio'] } }); // socio == dom in naisata_db
+    const admins = await User.find({ rol: { $in: ['admin', 'socio', 'dom'] } }); // socio == dom in naisata_db
     for (const admin of admins) {
       sendPushNotification(admin._id, {
         title: 'Nuevo Reporte',
@@ -187,6 +206,7 @@ router.post('/:id/tiradas', async (req, res) => {
   const tarea = await Task.findById(req.params.id);
   if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
 
+  if (bloqueaExtras(req, tarea)) return res.status(403).json({ error: 'El administrador no permitió agregar tiradas extra' });
   tarea.tiradas.push({ nombre, categoria, metrosEstimados });
   
   // Reoptimizar todas las tiradas usando las bobinas actuales
@@ -221,6 +241,7 @@ router.delete('/:id/tiradas/:index', async (req, res) => {
       return res.status(400).json({ error: 'Índice de tirada inválido' });
     }
 
+    if (bloqueaExtras(req, tarea)) return res.status(403).json({ error: 'No tienes permiso para eliminar tiradas' });
     tarea.tiradas.splice(index, 1);
     
     // Reoptimizar todas las tiradas usando las bobinas actuales
@@ -245,6 +266,7 @@ router.post('/:id/bobinas', async (req, res) => {
   const tarea = await Task.findById(req.params.id).populate('bobinas');
   if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
 
+  if (bloqueaExtras(req, tarea)) return res.status(403).json({ error: 'El administrador no permitió agregar bobinas extra' });
   const bobina = await Bobina.findById(bobinaId);
   if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
   if (bobina.estado !== 'disponible') return res.status(400).json({ error: 'Bobina no está disponible' });
@@ -322,8 +344,9 @@ router.post('/:id/finalize', async (req, res) => {
   if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
 
   for (const bobinaId of tarea.bobinas) {
-    const decision = decisiones[bobinaId];
-    if (decision) {
+    const decision = (decisiones || {})[bobinaId];
+    const b0 = await Bobina.findById(bobinaId).select('tareaActual');
+    if (decision && b0 && String(b0.tareaActual) === String(tarea._id)) {
       const nuevoEstado = decision === 'regresar' ? 'disponible' : 'desecho';
       await Bobina.findByIdAndUpdate(bobinaId, { 
         estado: nuevoEstado, 
@@ -462,6 +485,81 @@ router.post('/:id/employee-finalize', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// ── Iniciar tarea (empleado / admin) ──
+router.post('/:id/start', async (req, res) => {
+  try {
+    const t = await Task.findById(req.params.id).select('estado startedAt');
+    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (t.estado === 'pendiente') {
+      t.estado = 'en_progreso'; if (!t.startedAt) t.startedAt = new Date(); await t.save();
+    }
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'cambio_estado', estado: t.estado });
+    res.json({ ok: true, estado: t.estado });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Avance parcial: guarda reporte SIN enviar a revisión ──
+router.post('/:id/avance', async (req, res) => {
+  try {
+    const { comentario, fotos } = req.body || {};
+    if (!comentario || !String(comentario).trim()) return res.status(400).json({ error: 'El comentario es obligatorio' });
+    const t = await Task.findById(req.params.id).select('titulo estado startedAt');
+    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (t.estado === 'revisada') return res.status(400).json({ error: 'La tarea ya fue aprobada' });
+    await Report.create({ tarea: t._id, autor: req.user.id, comentario: String(comentario).trim(), fotos: fotos || [] });
+    const upd = {};
+    if (t.estado === 'pendiente') upd.estado = 'en_progreso';
+    if (t.estado === 'requiere_evidencia') upd.estado = 'enviada'; // ya respondió a la solicitud del admin
+    if (!t.startedAt) upd.startedAt = new Date();
+    if (Object.keys(upd).length) await Task.findByIdAndUpdate(t._id, upd);
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'nuevo_reporte' });
+    avisarAdmins('Nuevo avance', `${req.user.nombre || 'El técnico'} registró un avance en: ${t.titulo}`, t._id);
+    res.status(201).json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Terminar y enviar a revisión ──
+router.post('/:id/enviar-revision', async (req, res) => {
+  try {
+    const t = await Task.findById(req.params.id).select('titulo estado');
+    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (!['pendiente', 'en_progreso', 'requiere_evidencia'].includes(t.estado)) return res.status(400).json({ error: 'La tarea no se puede enviar en su estado actual' });
+    t.estado = 'enviada'; await t.save();
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'cambio_estado', estado: 'enviada' });
+    avisarAdmins('Tarea lista para revisar', `${req.user.nombre || 'El técnico'} envió a revisión: ${t.titulo}`, t._id);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Solicitar material / avisar que falta cable ──
+router.post('/:id/solicitar-material', async (req, res) => {
+  try {
+    const mensaje = String((req.body || {}).mensaje || '').trim().slice(0, 500);
+    if (!mensaje) return res.status(400).json({ error: 'Escribe qué material necesitas' });
+    const t = await Task.findById(req.params.id).select('titulo');
+    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
+    await Report.create({ tarea: t._id, autor: req.user.id, comentario: `📦 Solicitud de material: ${mensaje}` });
+    const io = req.app.get('io');
+    if (io) io.emit('solicitud_material', { taskId: String(t._id), usuario: req.user.nombre, tareaNombre: t.titulo, mensaje });
+    avisarAdmins('📦 Solicitud de material', `${req.user.nombre || 'El técnico'} (${t.titulo}): ${mensaje}`, t._id);
+    res.status(201).json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Empleado devuelve al almacén una bobina que tiene asignada sin tarea ──
+router.post('/mis-bobinas/:bid/devolver', async (req, res) => {
+  try {
+    const b = await Bobina.findOneAndUpdate(
+      { _id: req.params.bid, empleadoAsignado: req.user.id, estado: 'asignada', tareaActual: null },
+      { estado: 'disponible', empleadoAsignado: null }, { new: true });
+    if (!b) return res.status(404).json({ error: 'Bobina no encontrada o ya está en uso' });
+    res.json(b);
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 module.exports = router;

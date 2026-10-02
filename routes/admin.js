@@ -18,10 +18,13 @@ const router = express.Router();
 // o el sistema externo a.naisata.com con el header x-api-key
 router.use(adminOrApiKey);
 
+// Crear/editar/borrar usuarios y crear/editar/borrar tareas: solo admin (o integración externa)
+const soloAdmin = (req, res, next) => (req.user && req.user.rol === 'admin') ? next() : res.status(403).json({ error: 'Solo el administrador puede hacer esto' });
+
 // Crear usuario (empleado, dom o admin)
 // Los usuarios de app-it quedan marcados con origen:'app-it' y un usernameKey único,
 // y nunca pueden coincidir con ninguna otra cuenta de la base (CRM incluido).
-router.post('/users', async (req, res) => {
+router.post('/users', soloAdmin, async (req, res) => {
   try {
     const body = req.body || {};
     const username = normalizarUsername(body.username);
@@ -72,16 +75,17 @@ router.get('/users', async (req, res) => {
 });
 
 // Editar usuario (solo usuarios de app-it, nunca cuentas del CRM)
-router.put('/users/:id', async (req, res) => {
+router.put('/users/:id', soloAdmin, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Usuario no encontrado' });
-    const { nombre, rol, password } = req.body || {};
+    const { nombre, rol, password, activo } = req.body || {};
     if (rol && !ROLES.includes(rol)) {
       return res.status(400).json({ error: 'Rol invalido' });
     }
     const updateData = {};
     if (nombre) updateData.nombre = String(nombre).trim().slice(0, 100);
     if (rol) updateData.rol = rol;
+    if (typeof activo === 'boolean') { updateData.activo = activo; updateData.estadoCuenta = activo ? 'activa' : 'inactiva'; }
     if (password) {
       if (!esPinValido(password)) return res.status(400).json({ error: MSG_PIN });
       updateData.password = await bcrypt.hash(password, 10);
@@ -99,7 +103,7 @@ router.put('/users/:id', async (req, res) => {
 });
 
 // Eliminar usuario (solo usuarios de app-it)
-router.delete('/users/:id', async (req, res) => {
+router.delete('/users/:id', soloAdmin, async (req, res) => {
   try {
     if (req.params.id === req.user.id) {
       return res.status(400).json({ error: 'No puedes eliminar tu propio usuario' });
@@ -114,9 +118,9 @@ router.delete('/users/:id', async (req, res) => {
 });
 
 // Crear tarea con todos sus detalles
-router.post('/tasks', async (req, res) => {
+router.post('/tasks', soloAdmin, async (req, res) => {
   try {
-    const { titulo, descripcion, prioridad, ubicacion, contacto, fotosReferencia, asignadoA, tiradas, bobinaIds, cotizacionId } = req.body;
+    const { titulo, descripcion, prioridad, ubicacion, contacto, fotosReferencia, asignadoA, tiradas, bobinaIds, cotizacionId, permitirExtras } = req.body;
     
     // Obtener las bobinas completas desde la base de datos
     let bobinasCompletas = [];
@@ -136,6 +140,7 @@ router.post('/tasks', async (req, res) => {
       fotosReferencia: fotosReferencia || [],
       asignadoA,
       cotizacionId: cotizacionId || '',
+      permitirExtras: !!permitirExtras,
       bobinas: bobinasCompletas.map(b => b._id),
       tiradas: tiradasOpt,
       creadoPor: req.user.esIntegracionExterna ? undefined : req.user.id,
@@ -166,7 +171,7 @@ router.post('/tasks', async (req, res) => {
 });
 
 // Eliminar tarea (solo admin)
-router.delete('/tasks/:id', async (req, res) => {
+router.delete('/tasks/:id', soloAdmin, async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
@@ -219,6 +224,41 @@ router.post('/bobina-desasignar/:id', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// Editar / reasignar tarea (solo admin)
+router.put('/tasks/:id', soloAdmin, async (req, res) => {
+  try {
+    const { titulo, prioridad, ubicacion, contacto, asignadoA, permitirExtras } = req.body || {};
+    const u = {};
+    if (titulo && String(titulo).trim()) u.titulo = String(titulo).trim();
+    if (['alta', 'media', 'baja'].includes(prioridad)) u.prioridad = prioridad;
+    if (ubicacion !== undefined) u.ubicacion = String(ubicacion).trim();
+    if (contacto !== undefined) u.contacto = String(contacto).trim();
+    if (asignadoA && mongoose.isValidObjectId(asignadoA)) u.asignadoA = asignadoA;
+    if (typeof permitirExtras === 'boolean') u.permitirExtras = permitirExtras;
+    const antes = await Task.findById(req.params.id).select('asignadoA');
+    if (!antes) return res.status(404).json({ error: 'Tarea no encontrada' });
+    const t = await Task.findByIdAndUpdate(req.params.id, { $set: u }, { new: true }).select('-fotosReferencia -tiradas -bobinas');
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'editada' });
+    if (u.asignadoA && String(antes.asignadoA) !== String(u.asignadoA)) {
+      sendPushNotification(u.asignadoA, { title: 'Nueva Tarea Asignada', body: `Te han asignado la tarea: ${t.titulo}`, url: `/?id=${t._id}` });
+    }
+    res.json(t);
+  } catch (err) { res.status(400).json({ error: 'No se pudo editar la tarea', detalle: err.message }); }
+});
+
+// Reabrir una tarea ya aprobada (admin o dom)
+router.post('/tasks/:id/reabrir', async (req, res) => {
+  try {
+    const t = await Task.findByIdAndUpdate(req.params.id, { $set: { estado: 'en_progreso' }, $unset: { completedAt: '' } }, { new: true }).select('titulo asignadoA');
+    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'cambio_estado', estado: 'en_progreso' });
+    sendPushNotification(t.asignadoA, { title: 'Tarea reabierta', body: `Se reabrió la tarea: ${t.titulo}`, url: `/?id=${t._id}` });
+    res.json({ ok: true });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 module.exports = router;

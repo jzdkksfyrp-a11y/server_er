@@ -14,6 +14,7 @@ const taskSchema = new mongoose.Schema(
     cotizacionFolio: { type: String, default: '' }, // Folio asignado a posteriori por admin
     creadoPorEmpleado: { type: Boolean, default: false }, // true si el empleado creó la tarea sin tener asignación previa
     entregableGenerado: { type: Boolean, default: false },
+    permitirExtras: { type: Boolean, default: false }, // el empleado puede agregar tiradas/bobinas
     estado: {
       type: String,
       enum: ['pendiente', 'en_progreso', 'enviada', 'requiere_evidencia', 'revisada'],
