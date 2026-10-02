@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
+const { FILTRO_APP_IT } = require('../utils/usuariosAppIt');
 const EmployeeProfile = require('../models/EmployeeProfile');
 const EmployeeDocument = require('../models/EmployeeDocument');
 const EmployeeAudit = require('../models/EmployeeAudit');
@@ -178,7 +179,8 @@ router.get('/', async (req, res) => {
   try {
     // La lista solo necesita un resumen. Los PDFs/imágenes históricos pueden
     // ser muy pesados y se consultan únicamente al abrir ese expediente.
-    const users = await mongoose.connection.db.collection('users').find({}, {
+    // Los usuarios creados desde app-it (origen 'app-it') son una cuenta aparte y no son empleados del CRM.
+    const users = await mongoose.connection.db.collection('users').find({ $nor: [FILTRO_APP_IT] }, {
       projection: { fotoPerfil: 0, firma: 0, password: 0, documentos: 0 },
     }).sort({ nombre: 1, apellido: 1 }).toArray();
     // Una versión antigua generó algunos registros sombra: mismo texto de _id,
