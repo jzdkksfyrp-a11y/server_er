@@ -50,6 +50,7 @@ const taskRoutes = require('./routes/tasks');
 const inventoryRoutes = require('./routes/inventory');
 const gpsRoutes = require('./routes/gps');
 const employeeRoutes = require('./routes/employees');
+const { prepararUsuariosAppIt } = require('./utils/usuariosAppIt');
 
 const app = express();
 const http = require('http');
@@ -91,7 +92,10 @@ mongoose.connect(process.env.MONGODB_URI, {
   socketTimeoutMS:          45000,
   family: 4,
 })
-  .then(() => console.log('Conectado a MongoDB Atlas'))
+  .then(async () => {
+    console.log('Conectado a MongoDB Atlas');
+    await prepararUsuariosAppIt(); // marca usuarios antiguos de app-it y asegura el índice único
+  })
   .catch((err) => console.error('Error al conectar a MongoDB:', err.message));
 
 app.use('/auth', authRoutes);

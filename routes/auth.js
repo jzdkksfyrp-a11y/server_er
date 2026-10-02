@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { FILTRO_APP_IT, normalizarUsername } = require('../utils/usuariosAppIt');
 
 const router = express.Router();
 
@@ -38,19 +39,20 @@ function verificarPasswordUniversal(password, storedPassword) {
 }
 
 // Mapa de roles de naisata_db → roles internos de app-it
-const ROL_MAP = { admin: 'admin', socio: 'dom', user: 'empleado' };
+// (incluye los roles propios de app-it: antes 'dom' caía en 'empleado' al iniciar sesión)
+const ROL_MAP = { admin: 'admin', socio: 'dom', user: 'empleado', dom: 'dom', empleado: 'empleado' };
 
 router.get('/users', async (req, res) => {
   try {
-    // Solo traer los usuarios que fueron creados desde este programa (que tienen el campo creadoPor)
-    const users = await User.find({ creadoPor: { $exists: true } }, 'correo username nombre activo estadoCuenta').sort({ nombre: 1 });
+    // Solo usuarios creados desde app-it (origen 'app-it'); los del CRM no se mezclan
+    const users = await User.find(FILTRO_APP_IT, 'correo username nombre activo estadoCuenta').sort({ nombre: 1 });
     
     // Filtrar solo los activos
     const activeUsers = users.filter(u => typeof u.activo === 'boolean' ? u.activo : u.estadoCuenta === 'activa');
     
     const publicUsers = activeUsers.map(u => ({
-      loginId: u.correo || u.username,
-      nombre: u.nombre || u.correo || u.username
+      loginId: u.username || u.correo,
+      nombre: u.nombre || u.username || u.correo
     }));
     
     res.json(publicUsers);
@@ -61,12 +63,24 @@ router.get('/users', async (req, res) => {
 
 router.post('/login', async (req, res) => {
   try {
-    const { username, password } = req.body; // el frontend sigue mandando "username"
+    const { username, password } = req.body || {}; // el frontend sigue mandando "username"
 
-    // Busca por correo O por username (compatible con ambos esquemas)
-    const user = await User.findOne({
-      $or: [{ correo: username }, { username }],
+    // Solo strings: evita inyección de operadores Mongo (ej. {"$ne": null}) en el login
+    if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password) {
+      return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
+    const loginId = username.trim();
+    const loginKey = normalizarUsername(loginId);
+
+    // 1) Primero el usuario propio de app-it (único por username, sin importar mayúsculas)
+    let user = await User.findOne({
+      $and: [FILTRO_APP_IT, { $or: [{ usernameKey: loginKey }, { username: loginId }] }],
     });
+
+    // 2) Compatibilidad: cuentas de naisata_db que ya entraban por correo/username
+    if (!user) {
+      user = await User.findOne({ $or: [{ correo: loginId }, { username: loginId }] });
+    }
 
     if (!user) {
       console.log(`[LOGIN FALLIDO] Usuario no encontrado: ${username}`);

@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Task = require('../models/Task');
@@ -6,6 +7,10 @@ const Bobina = require('../models/Bobina');
 const { adminOrApiKey } = require('../middleware/auth');
 const { optimizarCortes } = require('../utils/cableOptimizer');
 const { sendPushNotification } = require('./push');
+const {
+  ORIGEN, ROLES, PASSWORD_MIN, FILTRO_APP_IT,
+  normalizarUsername, validarNuevoUsuario, existeIdentidad,
+} = require('../utils/usuariosAppIt');
 
 const router = express.Router();
 
@@ -14,53 +19,96 @@ const router = express.Router();
 router.use(adminOrApiKey);
 
 // Crear usuario (empleado, dom o admin)
+// Los usuarios de app-it quedan marcados con origen:'app-it' y un usernameKey único,
+// y nunca pueden coincidir con ninguna otra cuenta de la base (CRM incluido).
 router.post('/users', async (req, res) => {
   try {
-    const { username, password, nombre, rol } = req.body;
-    if (!['empleado', 'dom', 'admin'].includes(rol)) {
-      return res.status(400).json({ error: 'Rol invalido' });
+    const body = req.body || {};
+    const username = normalizarUsername(body.username);
+    const nombre = String(body.nombre || '').trim();
+    const password = typeof body.password === 'string' ? body.password : '';
+    const rol = String(body.rol || '').trim();
+
+    const errorValidacion = validarNuevoUsuario({ username, password, nombre, rol });
+    if (errorValidacion) return res.status(400).json({ error: errorValidacion });
+
+    if (await existeIdentidad(username)) {
+      return res.status(409).json({ error: 'Ya existe un usuario con ese nombre de usuario. Elige otro.' });
     }
+
     const hash = await bcrypt.hash(password, 10);
-    const user = await User.create({ username, password: hash, nombre, rol, creadoPor: req.user.id });
+    const datos = {
+      username,
+      usernameKey: username,
+      password: hash,
+      nombre,
+      rol,
+      origen: ORIGEN,
+      estadoCuenta: 'activa',
+      activo: true,
+    };
+    // Con la API key externa no hay un id de usuario real
+    if (mongoose.isValidObjectId(req.user.id)) datos.creadoPor = req.user.id;
+
+    const user = await User.create(datos);
     res.status(201).json({ id: user._id, username: user.username, nombre: user.nombre, rol: user.rol, creadoPor: user.creadoPor });
   } catch (err) {
-    res.status(400).json({ error: 'No se pudo crear el usuario', detalle: err.message });
+    if (err && err.code === 11000) {
+      return res.status(409).json({ error: 'Ya existe un usuario con ese nombre de usuario. Elige otro.' });
+    }
+    console.error('Error creando usuario:', err);
+    res.status(500).json({ error: 'No se pudo crear el usuario' });
   }
 });
 
-// Listar usuarios (para el selector de "asignar a" en crear tarea)
+// Listar usuarios (para el selector de "asignar a" en crear tarea). Solo usuarios de app-it.
 router.get('/users', async (req, res) => {
-  const users = await User.find({ creadoPor: { $exists: true } }, '-password').sort({ nombre: 1 });
-  res.json(users);
+  try {
+    const users = await User.find(FILTRO_APP_IT, '-password').sort({ nombre: 1 });
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: 'Error al obtener usuarios' });
+  }
 });
 
-// Editar usuario
+// Editar usuario (solo usuarios de app-it, nunca cuentas del CRM)
 router.put('/users/:id', async (req, res) => {
   try {
-    const { nombre, rol, password } = req.body;
-    if (rol && !['empleado', 'dom', 'admin'].includes(rol)) {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const { nombre, rol, password } = req.body || {};
+    if (rol && !ROLES.includes(rol)) {
       return res.status(400).json({ error: 'Rol invalido' });
     }
     const updateData = {};
-    if (nombre) updateData.nombre = nombre;
+    if (nombre) updateData.nombre = String(nombre).trim().slice(0, 100);
     if (rol) updateData.rol = rol;
     if (password) {
+      if (typeof password !== 'string' || password.length < PASSWORD_MIN) {
+        return res.status(400).json({ error: `La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.` });
+      }
       updateData.password = await bcrypt.hash(password, 10);
     }
-    const user = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).select('-password');
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.id, ...FILTRO_APP_IT },
+      { $set: updateData },
+      { new: true }
+    ).select('-password');
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json(user);
   } catch (err) {
     res.status(400).json({ error: 'No se pudo editar el usuario', detalle: err.message });
   }
 });
 
-// Eliminar usuario
+// Eliminar usuario (solo usuarios de app-it)
 router.delete('/users/:id', async (req, res) => {
   try {
     if (req.params.id === req.user.id) {
       return res.status(400).json({ error: 'No puedes eliminar tu propio usuario' });
     }
-    await User.findByIdAndDelete(req.params.id);
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const user = await User.findOneAndDelete({ _id: req.params.id, ...FILTRO_APP_IT });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json({ success: true });
   } catch (err) {
     res.status(400).json({ error: 'No se pudo eliminar el usuario', detalle: err.message });

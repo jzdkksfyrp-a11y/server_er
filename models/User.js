@@ -7,7 +7,9 @@ const mongoose = require('mongoose');
 const userSchema = new mongoose.Schema(
   {
     correo:       { type: String, trim: true },      // identificador principal de login en naisata_db
-    username:     { type: String, trim: true },      // alias
+    username:     { type: String, trim: true },      // alias (login de los usuarios creados desde app-it)
+    usernameKey:  { type: String },                  // username en minúsculas; único entre usuarios de app-it
+    origen:       { type: String },                  // 'app-it' = usuario creado desde esta app (no mezclar con CRM/naisata)
     password:     { type: String },                  // hash bcrypt
     nombre:       { type: String },
     rol:          { type: String },                  // 'admin' | 'socio' | 'user'
@@ -16,6 +18,18 @@ const userSchema = new mongoose.Schema(
     creadoPor:    { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { strict: false, timestamps: true }
+);
+
+// Un username no puede repetirse entre usuarios de app-it (sin distinguir mayúsculas).
+// Índice parcial: solo aplica a los usuarios marcados origen:'app-it', así no afecta a
+// los demás usuarios de la colección compartida.
+userSchema.index(
+  { usernameKey: 1 },
+  {
+    unique: true,
+    name: 'uniq_appit_usernameKey',
+    partialFilterExpression: { origen: 'app-it', usernameKey: { $type: 'string' } },
+  }
 );
 
 // Propiedad virtual: devuelve el identificador de login unificado
