@@ -13,6 +13,9 @@ router.get('/', async (req, res) => {
     if (req.query.estado) {
       filtro.estado = req.query.estado;
     }
+    // Las bobinas del cliente (origen 'externa') no son existencia de la empresa: se ocultan por defecto.
+    // $ne también incluye los documentos antiguos que no tienen el campo.
+    if (req.query.incluirExternas !== '1') filtro.origen = { $ne: 'externa' };
     const bobinas = await Bobina.find(filtro)
       .populate('tareaActual', 'titulo')
       .populate('empleadoAsignado', 'nombre');
@@ -85,6 +88,37 @@ router.post('/:id/asignar-empleado', async (req, res) => {
   }
 });
 
+// Convertir una bobina del cliente (ya devuelta/desechada o sin tarea) en bobina de la empresa (solo admin o dom)
+router.post('/:id/pasar-a-inventario', async (req, res) => {
+  if (!['admin', 'dom'].includes(req.user.rol)) {
+    return res.status(403).json({ error: 'No tienes permiso' });
+  }
+  try {
+    const bobina = await Bobina.findById(req.params.id);
+    if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
+    if (bobina.origen !== 'externa') return res.status(400).json({ error: 'Esa bobina ya es de la empresa' });
+    if (bobina.estado === 'asignada') return res.status(400).json({ error: 'La bobina sigue en una tarea activa. Finaliza la tarea primero.' });
+    if (bobina.metrosRestantes <= 0) return res.status(400).json({ error: 'La bobina no tiene cable restante' });
+    let folio, isUnique = false;
+    while (!isUnique) {
+      folio = Math.floor(10000 + Math.random() * 90000).toString();
+      isUnique = !(await Bobina.findOne({ folio }));
+    }
+    bobina.origen = 'inventario';
+    bobina.folio = folio;
+    bobina.estado = 'disponible';
+    bobina.tareaActual = null;
+    bobina.empleadoAsignado = null;
+    bobina.metrosAlAsignar = undefined;
+    // Para que el cálculo parta de lo que realmente queda
+    bobina.metrosIniciales = bobina.metrosRestantes;
+    await bobina.save();
+    res.json(bobina);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Editar bobina
 router.put('/:id', async (req, res) => {
   if (!['admin', 'dom'].includes(req.user.rol)) {
@@ -115,9 +149,8 @@ router.put('/:id', async (req, res) => {
       bobina.folio = folio;
     }
 
-    const usado = bobina.metrosIniciales - bobina.metrosRestantes;
     bobina.metrosIniciales = metrosIniciales || bobina.metrosIniciales;
-    bobina.metrosRestantes = Math.max(0, bobina.metrosIniciales - usado);
+    bobina.metrosRestantes = bobina.metrosIniciales; // Reset
     await bobina.save();
     res.json(bobina);
   } catch (err) {

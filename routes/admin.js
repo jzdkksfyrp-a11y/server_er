@@ -8,23 +8,23 @@ const { adminOrApiKey } = require('../middleware/auth');
 const { optimizarCortes } = require('../utils/cableOptimizer');
 const { sendPushNotification } = require('./push');
 const {
-  ORIGEN, ROLES, MSG_PIN, FILTRO_APP_IT, esPinValido,
+  ORIGEN, ROLES, PASSWORD_MIN, FILTRO_APP_IT,
   normalizarUsername, validarNuevoUsuario, existeIdentidad,
 } = require('../utils/usuariosAppIt');
 
 const router = express.Router();
 
+const TOPE_METROS_BOBINA = Number(process.env.TOPE_METROS_BOBINA) || 10000;
+const CATEGORIAS_CABLE = ['utp_cat5e', 'utp_cat6', 'utp_cat6a', 'fibra_monomodo', 'fibra_multimodo', 'control_acceso', 'audio', 'otro'];
+
 // Todo lo que hay aqui abajo lo puede usar el frontend (admin logueado)
 // o el sistema externo a.naisata.com con el header x-api-key
 router.use(adminOrApiKey);
 
-// Crear/editar/borrar usuarios y crear/editar/borrar tareas: solo admin (o integración externa)
-const soloAdmin = (req, res, next) => (req.user && req.user.rol === 'admin') ? next() : res.status(403).json({ error: 'Solo el administrador puede hacer esto' });
-
 // Crear usuario (empleado, dom o admin)
 // Los usuarios de app-it quedan marcados con origen:'app-it' y un usernameKey único,
 // y nunca pueden coincidir con ninguna otra cuenta de la base (CRM incluido).
-router.post('/users', soloAdmin, async (req, res) => {
+router.post('/users', async (req, res) => {
   try {
     const body = req.body || {};
     const username = normalizarUsername(body.username);
@@ -75,19 +75,20 @@ router.get('/users', async (req, res) => {
 });
 
 // Editar usuario (solo usuarios de app-it, nunca cuentas del CRM)
-router.put('/users/:id', soloAdmin, async (req, res) => {
+router.put('/users/:id', async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Usuario no encontrado' });
-    const { nombre, rol, password, activo } = req.body || {};
+    const { nombre, rol, password } = req.body || {};
     if (rol && !ROLES.includes(rol)) {
       return res.status(400).json({ error: 'Rol invalido' });
     }
     const updateData = {};
     if (nombre) updateData.nombre = String(nombre).trim().slice(0, 100);
     if (rol) updateData.rol = rol;
-    if (typeof activo === 'boolean') { updateData.activo = activo; updateData.estadoCuenta = activo ? 'activa' : 'inactiva'; }
     if (password) {
-      if (!esPinValido(password)) return res.status(400).json({ error: MSG_PIN });
+      if (typeof password !== 'string' || password.length < PASSWORD_MIN) {
+        return res.status(400).json({ error: `La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.` });
+      }
       updateData.password = await bcrypt.hash(password, 10);
     }
     const user = await User.findOneAndUpdate(
@@ -103,7 +104,7 @@ router.put('/users/:id', soloAdmin, async (req, res) => {
 });
 
 // Eliminar usuario (solo usuarios de app-it)
-router.delete('/users/:id', soloAdmin, async (req, res) => {
+router.delete('/users/:id', async (req, res) => {
   try {
     if (req.params.id === req.user.id) {
       return res.status(400).json({ error: 'No puedes eliminar tu propio usuario' });
@@ -118,9 +119,10 @@ router.delete('/users/:id', soloAdmin, async (req, res) => {
 });
 
 // Crear tarea con todos sus detalles
-router.post('/tasks', soloAdmin, async (req, res) => {
+router.post('/tasks', async (req, res) => {
+  let externasCreadas = [];
   try {
-    const { titulo, descripcion, prioridad, ubicacion, contacto, fotosReferencia, asignadoA, tiradas, bobinaIds, cotizacionId, permitirExtras } = req.body;
+    const { titulo, descripcion, prioridad, ubicacion, contacto, fotosReferencia, asignadoA, tiradas, bobinaIds, bobinasExternas, cotizacionId, bobinasEnSitio, permiteRegistrarBobinas, permitirExtras } = req.body;
     
     // Obtener las bobinas completas desde la base de datos
     let bobinasCompletas = [];
@@ -128,8 +130,36 @@ router.post('/tasks', soloAdmin, async (req, res) => {
       bobinasCompletas = await Bobina.find({ _id: { $in: bobinaIds }, estado: 'disponible' });
     }
 
+    // Bobinas nuevas que no están en el inventario (p. ej. las pone el cliente): se validan y se crean con la tarea
+    const externasValidas = [];
+    if (!bobinasEnSitio && Array.isArray(bobinasExternas)) {
+      const nombresUsados = new Set(bobinasCompletas.map(b => String(b.nombre).trim().toLowerCase()));
+      for (const raw of bobinasExternas.slice(0, 50)) {
+        const nombre = String((raw && raw.nombre) || '').trim().slice(0, 80);
+        const categoria = raw && raw.categoria;
+        const metros = Number(raw && raw.metrosIniciales);
+        if (!nombre) return res.status(400).json({ error: 'El nombre de la bobina nueva es obligatorio' });
+        if (!CATEGORIAS_CABLE.includes(categoria)) return res.status(400).json({ error: `Tipo de cable inválido en la bobina "${nombre}"` });
+        if (!(metros > 0) || metros > TOPE_METROS_BOBINA) return res.status(400).json({ error: `Los metros de "${nombre}" deben ser mayores a 0 y menores o iguales a ${TOPE_METROS_BOBINA}` });
+        if (nombresUsados.has(nombre.toLowerCase())) return res.status(409).json({ error: `Ya hay una bobina llamada "${nombre}" en esta tarea. Usa otro nombre.` });
+        nombresUsados.add(nombre.toLowerCase());
+        externasValidas.push({ nombre, categoria, metrosIniciales: metros });
+      }
+    }
+    // Sin folio: las del cliente no llevan folio (el índice único es sparse) y no cuentan como existencia
+    externasCreadas = externasValidas.length
+      ? await Bobina.insertMany(externasValidas.map(b => ({
+          ...b, origen: 'externa', estado: 'asignada',
+          metrosRestantes: b.metrosIniciales, metrosAlAsignar: b.metrosIniciales,
+          empleadoAsignado: asignadoA || null,
+        })))
+      : [];
+    bobinasCompletas = bobinasCompletas.concat(externasCreadas);
+
     // Correr motor de optimización si hay tiradas y bobinas
-    const { bobinas: bobinasOpt, tiradas: tiradasOpt } = optimizarCortes(bobinasCompletas, tiradas || []);
+    // Sin bobinas, las tiradas quedan "pendiente_bobina" (no "Sin cable suficiente"). Base = metros que tiene cada bobina hoy.
+    const paraCalculo = bobinasCompletas.map(b => ({ _id: b._id, nombre: b.nombre, categoria: b.categoria, metrosIniciales: b.metrosIniciales, metrosAlAsignar: b.metrosRestantes }));
+    const { tiradas: tiradasOpt } = optimizarCortes(paraCalculo, tiradas || []);
 
     const task = await Task.create({
       titulo,
@@ -140,6 +170,8 @@ router.post('/tasks', soloAdmin, async (req, res) => {
       fotosReferencia: fotosReferencia || [],
       asignadoA,
       cotizacionId: cotizacionId || '',
+      bobinasEnSitio: !!bobinasEnSitio,
+      permiteRegistrarBobinas: !!permiteRegistrarBobinas,
       permitirExtras: !!permitirExtras,
       bobinas: bobinasCompletas.map(b => b._id),
       tiradas: tiradasOpt,
@@ -148,10 +180,9 @@ router.post('/tasks', soloAdmin, async (req, res) => {
 
     // Actualizar estado de las bobinas a 'asignada'
     if (bobinasCompletas.length > 0) {
-      await Bobina.updateMany(
-        { _id: { $in: bobinasCompletas.map(b => b._id) } },
-        { $set: { estado: 'asignada', tareaActual: task._id } }
-      );
+      await Bobina.bulkWrite(bobinasCompletas.map(b => ({
+        updateOne: { filter: { _id: b._id }, update: { $set: { estado: 'asignada', tareaActual: task._id, metrosAlAsignar: b.metrosRestantes } } }
+      })));
     }
 
     const io = req.app.get('io');
@@ -166,21 +197,25 @@ router.post('/tasks', soloAdmin, async (req, res) => {
 
     res.status(201).json(task);
   } catch (err) {
+    // No dejar bobinas nuevas huérfanas si la tarea no se pudo crear
+    if (externasCreadas.length) await Bobina.deleteMany({ _id: { $in: externasCreadas.map(b => b._id) }, tareaActual: null }).catch(() => {});
     res.status(400).json({ error: 'No se pudo crear la tarea', detalle: err.message });
   }
 });
 
 // Eliminar tarea (solo admin)
-router.delete('/tasks/:id', soloAdmin, async (req, res) => {
+router.delete('/tasks/:id', async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
     
     // Liberar bobinas asignadas
     if (task.bobinas && task.bobinas.length > 0) {
+      // Las bobinas del cliente se eliminan; las de inventario se liberan como siempre
+      await Bobina.deleteMany({ _id: { $in: task.bobinas }, origen: 'externa' });
       await Bobina.updateMany(
-        { _id: { $in: task.bobinas } },
-        { $set: { estado: 'disponible' }, $unset: { tareaActual: "" } }
+        { _id: { $in: task.bobinas }, origen: { $ne: 'externa' } },
+        { $set: { estado: 'disponible' }, $unset: { tareaActual: "", metrosAlAsignar: "" } }
       );
     }
     
@@ -224,41 +259,6 @@ router.post('/bobina-desasignar/:id', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-
-// Editar / reasignar tarea (solo admin)
-router.put('/tasks/:id', soloAdmin, async (req, res) => {
-  try {
-    const { titulo, prioridad, ubicacion, contacto, asignadoA, permitirExtras } = req.body || {};
-    const u = {};
-    if (titulo && String(titulo).trim()) u.titulo = String(titulo).trim();
-    if (['alta', 'media', 'baja'].includes(prioridad)) u.prioridad = prioridad;
-    if (ubicacion !== undefined) u.ubicacion = String(ubicacion).trim();
-    if (contacto !== undefined) u.contacto = String(contacto).trim();
-    if (asignadoA && mongoose.isValidObjectId(asignadoA)) u.asignadoA = asignadoA;
-    if (typeof permitirExtras === 'boolean') u.permitirExtras = permitirExtras;
-    const antes = await Task.findById(req.params.id).select('asignadoA');
-    if (!antes) return res.status(404).json({ error: 'Tarea no encontrada' });
-    const t = await Task.findByIdAndUpdate(req.params.id, { $set: u }, { new: true }).select('-fotosReferencia -tiradas -bobinas');
-    const io = req.app.get('io');
-    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'editada' });
-    if (u.asignadoA && String(antes.asignadoA) !== String(u.asignadoA)) {
-      sendPushNotification(u.asignadoA, { title: 'Nueva Tarea Asignada', body: `Te han asignado la tarea: ${t.titulo}`, url: `/?id=${t._id}` });
-    }
-    res.json(t);
-  } catch (err) { res.status(400).json({ error: 'No se pudo editar la tarea', detalle: err.message }); }
-});
-
-// Reabrir una tarea ya aprobada (admin o dom)
-router.post('/tasks/:id/reabrir', async (req, res) => {
-  try {
-    const t = await Task.findByIdAndUpdate(req.params.id, { $set: { estado: 'en_progreso' }, $unset: { completedAt: '' } }, { new: true }).select('titulo asignadoA');
-    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
-    const io = req.app.get('io');
-    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'cambio_estado', estado: 'en_progreso' });
-    sendPushNotification(t.asignadoA, { title: 'Tarea reabierta', body: `Se reabrió la tarea: ${t.titulo}`, url: `/?id=${t._id}` });
-    res.json({ ok: true });
-  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 module.exports = router;

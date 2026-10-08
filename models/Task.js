@@ -13,8 +13,11 @@ const taskSchema = new mongoose.Schema(
     cotizacionId: { type: String, default: '' },
     cotizacionFolio: { type: String, default: '' }, // Folio asignado a posteriori por admin
     creadoPorEmpleado: { type: Boolean, default: false }, // true si el empleado creó la tarea sin tener asignación previa
+    bobinasEnSitio: { type: Boolean, default: false },          // las bobinas las pone el cliente / se registran en sitio
+    permiteRegistrarBobinas: { type: Boolean, default: false }, // el empleado puede registrar o asignar bobinas
+    permitirExtras: { type: Boolean, default: false },          // permiso real (antes vivía como texto en la descripción)
+    comentarioCierre: { type: String, default: '' },
     entregableGenerado: { type: Boolean, default: false },
-    permitirExtras: { type: Boolean, default: false }, // el empleado puede agregar tiradas/bobinas
     estado: {
       type: String,
       enum: ['pendiente', 'en_progreso', 'enviada', 'requiere_evidencia', 'revisada'],
@@ -28,7 +31,9 @@ const taskSchema = new mongoose.Schema(
       metrosEstimados: { type: Number, required: true },
       metrosReales: { type: Number, default: 0 },
       cortado: { type: Boolean, default: false },
-      bobinaAsignada: { type: String, default: null } // Nombre de la bobina de donde se cortará
+      bobinaAsignada: { type: String, default: null }, // Nombre de la bobina de donde se cortará
+      bobinaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Bobina', default: null },
+      estadoAsignacion: { type: String, enum: ['asignada', 'pendiente_bobina', 'sin_cable', null], default: null }
     }],
     startedAt: { type: Date },
     completedAt: { type: Date },

@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Task = require('../models/Task');
 const Bobina = require('../models/Bobina');
 const Report = require('../models/Report');
@@ -10,23 +11,65 @@ const User = require('../models/User'); // Need User to find admins
 const router = express.Router();
 router.use(verifyToken);
 
-// Un empleado solo puede tocar tareas asignadas a él
-router.param('id', async (req, res, next, id) => {
-  if (req.user.rol !== 'empleado') return next();
-  try {
-    const t = await Task.findById(id).select('asignadoA');
-    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
-    if (String(t.asignadoA) !== String(req.user.id)) return res.status(403).json({ error: 'Esta tarea no está asignada a ti' });
-    next();
-  } catch (e) { res.status(400).json({ error: 'ID inválido' }); }
+// ── Helpers de bobinas en sitio / externas ───────────────────────────────────
+const TOPE_METROS_BOBINA = Number(process.env.TOPE_METROS_BOBINA) || 10000;
+const CATEGORIAS_CABLE = ['utp_cat5e', 'utp_cat6', 'utp_cat6a', 'fibra_monomodo', 'fibra_multimodo', 'control_acceso', 'audio', 'otro'];
+const CABLES_TIRADA = CATEGORIAS_CABLE;
+const esStaff = (u) => ['admin', 'dom'].includes(u.rol);
+const esAsignado = (u, t) => String(t.asignadoA) === String(u.id);
+// Permiso heredado: antes "Permitir extras" vivía como texto dentro de la descripción
+const extrasHeredado = (t) => !!t.permitirExtras || /\[Permitir extras:\s*SI\]/i.test(t.descripcion || '');
+// Quién puede registrar/quitar bobinas: admin/dom siempre; el empleado solo si es el asignado y la tarea lo permite
+const puedeGestionarBobinas = (u, t) =>
+  esStaff(u) || (esAsignado(u, t) && (!!t.bobinasEnSitio || !!t.permiteRegistrarBobinas || extrasHeredado(t)));
+
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+const manejarError = (res, err) => {
+  if (err && err.status) return res.status(err.status).json({ error: err.message });
+  console.error('[tasks]', err);
+  return res.status(err && err.name === 'ValidationError' ? 400 : 500).json({ error: err.message || 'Error interno' });
+};
+
+// Evita CastError (y peticiones colgadas) cuando el :id no es un ObjectId válido
+router.param('id', (req, res, next, id) => {
+  if (!mongoose.isValidObjectId(id)) return res.status(404).json({ error: 'Tarea no encontrada' });
+  next();
 });
 
-const bloqueaExtras = (req, t) => req.user.rol === 'empleado' && !t.permitirExtras && !t.creadoPorEmpleado;
-async function avisarAdmins(title, body, taskId) {
-  try {
-    const admins = await User.find({ rol: { $in: ['admin', 'socio', 'dom'] } });
-    for (const a of admins) sendPushNotification(a._id, { title, body, url: `/?id=${taskId}` });
-  } catch (e) { console.error('push admins:', e.message); }
+const resumirCalculo = (stats) => {
+  const ligera = (t) => ({ _id: t._id, nombre: t.nombre, cableRequerido: t.cableRequerido, metrosEstimados: t.metrosEstimados });
+  return {
+    esSuficiente: !!stats.esSuficiente,
+    sinBobinas: !!stats.sinBobinas,
+    metrosFaltantes: stats.metrosFaltantes || 0,
+    faltantesPorTipo: stats.faltantesPorTipo || {},
+    tiradasSinCable: (stats.tiradasSinCable || []).map(ligera),
+    tiradasPendientesBobina: (stats.tiradasPendientesBobina || []).map(ligera),
+    totalSobrante: stats.totalSobrante || 0,
+    bobinasSinUso: (stats.bobinasSinUsar || []).map(b => b.nombre),
+  };
+};
+
+// Cierre: a dónde va cada bobina. Las externas se devuelven al cliente ('devuelta') o se desechan.
+async function origenPorBobina(ids) {
+  const docs = await Bobina.find({ _id: { $in: ids } }).select('origen');
+  const m = {};
+  docs.forEach(d => { m[String(d._id)] = d.origen || 'inventario'; });
+  return m;
+}
+const destinoBobina = (origen, regresar) => (!regresar ? 'desecho' : (origen === 'externa' ? 'devuelta' : 'disponible'));
+
+// Carga la tarea con las bobinas pobladas, aplica `mutar` (opcional), corre el optimizador y guarda las
+// tiradas SIN sobrescribir tarea.bobinas. Todas las rutas que cambian bobinas o tiradas pasan por aquí.
+async function recalcularTarea(tareaId, mutar) {
+  const tarea = await Task.findById(tareaId).populate('bobinas');
+  if (!tarea) throw httpError(404, 'Tarea no encontrada');
+  if (mutar) await mutar(tarea);
+  if ((tarea.bobinas || []).some(b => !b || !b.nombre)) await tarea.populate('bobinas');
+  const { tiradas, stats } = optimizarCortes(tarea.bobinas, tarea.tiradas);
+  tarea.tiradas = tiradas;
+  await tarea.save();
+  return { tarea, resumen: resumirCalculo(stats) };
 }
 
 // Lista de tareas: el empleado solo ve las suyas (hasta las 9pm si están terminadas); admin y dom ven activas
@@ -123,7 +166,7 @@ router.post('/:id/reports', async (req, res) => {
 
   // Notificar a admins/dom
   try {
-    const admins = await User.find({ rol: { $in: ['admin', 'socio', 'dom'] } }); // socio == dom in naisata_db
+    const admins = await User.find({ rol: { $in: ['admin', 'socio'] } }); // socio == dom in naisata_db
     for (const admin of admins) {
       sendPushNotification(admin._id, {
         title: 'Nuevo Reporte',
@@ -201,102 +244,155 @@ router.patch('/:id/entregable', async (req, res) => {
 
 // Añadir nueva tirada (Admin / Dom / Empleado)
 router.post('/:id/tiradas', async (req, res) => {
-  // Ya no restringimos a admin/dom
-  const { nombre, categoria, metrosEstimados } = req.body;
-  const tarea = await Task.findById(req.params.id);
-  if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
+  try {
+    const { nombre, categoria, metrosEstimados, cableRequerido } = req.body || {};
+    const metros = Number(metrosEstimados);
+    if (!nombre || !categoria || !(metros > 0)) return res.status(400).json({ error: 'Nombre, categoría y metros (mayores a cero) son requeridos' });
+    if (cableRequerido && !CABLES_TIRADA.includes(cableRequerido)) return res.status(400).json({ error: 'Tipo de cable inválido' });
 
-  if (bloqueaExtras(req, tarea)) return res.status(403).json({ error: 'El administrador no permitió agregar tiradas extra' });
-  tarea.tiradas.push({ nombre, categoria, metrosEstimados });
-  
-  // Reoptimizar todas las tiradas usando las bobinas actuales
-  const { bobinas: bobinasOpt, tiradas: tiradasOpt } = optimizarCortes(tarea.bobinas, tarea.tiradas);
-  tarea.bobinas = bobinasOpt;
-  tarea.tiradas = tiradasOpt;
+    const _id = new mongoose.Types.ObjectId();
+    const { tarea, resumen } = await recalcularTarea(req.params.id, (t) => {
+      if (t.estado === 'revisada') throw httpError(400, 'No se pueden modificar tiradas de una tarea ya revisada.');
+      const nueva = { _id, nombre, categoria, metrosEstimados: metros };
+      if (cableRequerido) nueva.cableRequerido = cableRequerido;   // si no llega se conserva el valor por defecto actual
+      t.tiradas.push(nueva);
+    });
 
-  await tarea.save();
-
-  const io = req.app.get('io');
-  if (io) {
-    io.emit('task_updated', { taskId: req.params.id, tipo: 'nueva_tirada' });
-    if (req.user.rol === 'empleado') {
-      io.emit('nueva_tirada_empleado', { taskId: req.params.id, usuario: req.user.nombre, tareaNombre: tarea.titulo });
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('task_updated', { taskId: req.params.id, tipo: 'nueva_tirada' });
+      if (req.user.rol === 'empleado') {
+        io.emit('nueva_tirada_empleado', { taskId: req.params.id, usuario: req.user.nombre, tareaNombre: tarea.titulo });
+      }
     }
-  }
-
-  res.status(201).json(tarea.tiradas[tarea.tiradas.length - 1]);
+    const tirada = tarea.tiradas.id(_id);
+    res.status(201).json({ ...(tirada ? tirada.toObject() : {}), resumen });
+  } catch (err) { manejarError(res, err); }
 });
 
 // Eliminar tirada (Admin / Dom / Empleado)
 router.delete('/:id/tiradas/:index', async (req, res) => {
   try {
-    const tarea = await Task.findById(req.params.id);
-    if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
-    if (tarea.estado === 'revisada') {
-      return res.status(400).json({ error: 'No se pueden modificar tiradas de una tarea ya revisada.' });
-    }
-
-    const index = parseInt(req.params.index, 10);
-    if (isNaN(index) || index < 0 || index >= tarea.tiradas.length) {
-      return res.status(400).json({ error: 'Índice de tirada inválido' });
-    }
-
-    if (bloqueaExtras(req, tarea)) return res.status(403).json({ error: 'No tienes permiso para eliminar tiradas' });
-    tarea.tiradas.splice(index, 1);
-    
-    // Reoptimizar todas las tiradas usando las bobinas actuales
-    const { bobinas: bobinasOpt, tiradas: tiradasOpt } = optimizarCortes(tarea.bobinas, tarea.tiradas);
-    tarea.bobinas = bobinasOpt;
-    tarea.tiradas = tiradasOpt;
-
-    await tarea.save();
-
+    const { tarea, resumen } = await recalcularTarea(req.params.id, (t) => {
+      if (t.estado === 'revisada') throw httpError(400, 'No se pueden modificar tiradas de una tarea ya revisada.');
+      const index = parseInt(req.params.index, 10);
+      if (isNaN(index) || index < 0 || index >= t.tiradas.length) throw httpError(400, 'Índice de tirada inválido');
+      t.tiradas.splice(index, 1);
+    });
     const io = req.app.get('io');
     if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'tirada_eliminada' });
-
-    res.json(tarea);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+    res.json({ ...tarea.toObject(), resumen });
+  } catch (err) { manejarError(res, err); }
 });
 
 // Añadir bobina existente del inventario a la tarea
 router.post('/:id/bobinas', async (req, res) => {
-  const { bobinaId } = req.body;
-  const tarea = await Task.findById(req.params.id).populate('bobinas');
-  if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
+  try {
+    const { bobinaId } = req.body || {};
+    if (!mongoose.isValidObjectId(bobinaId)) return res.status(404).json({ error: 'Bobina no encontrada' });
+    const base = await Task.findById(req.params.id).select('asignadoA estado');
+    if (!base) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (!esStaff(req.user) && !esAsignado(req.user, base)) return res.status(403).json({ error: 'No tienes permiso para agregar bobinas a esta tarea' });
+    if (base.estado === 'revisada') return res.status(400).json({ error: 'No se pueden modificar bobinas de una tarea ya revisada.' });
 
-  if (bloqueaExtras(req, tarea)) return res.status(403).json({ error: 'El administrador no permitió agregar bobinas extra' });
-  const bobina = await Bobina.findById(bobinaId);
-  if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
-  if (bobina.estado !== 'disponible') return res.status(400).json({ error: 'Bobina no está disponible' });
+    const bobina = await Bobina.findById(bobinaId);
+    if (!bobina) return res.status(404).json({ error: 'Bobina no encontrada' });
+    if (bobina.estado !== 'disponible' || bobina.origen === 'externa') return res.status(400).json({ error: 'Bobina no está disponible' });
 
-  bobina.estado = 'asignada';
-  bobina.tareaActual = tarea._id;
-  await bobina.save();
+    bobina.estado = 'asignada';
+    bobina.tareaActual = base._id;
+    bobina.metrosAlAsignar = bobina.metrosRestantes;   // base del cálculo (resuelve el sobreestimado de bobinas ya usadas)
+    await bobina.save();
 
-  tarea.bobinas.push(bobina._id);
-  await tarea.save();
-  
-  // Re-fetch para poblar bobinas antes de optimizar
-  const tareaPoblada = await Task.findById(req.params.id).populate('bobinas');
+    const { tarea, resumen } = await recalcularTarea(req.params.id, (t) => { t.bobinas.push(bobina); });
 
-  // Reoptimizar todas las tiradas usando las nuevas bobinas
-  const { bobinas: bobinasOpt, tiradas: tiradasOpt } = optimizarCortes(tareaPoblada.bobinas, tareaPoblada.tiradas);
-  
-  // Guardar estado optimizado de tiradas
-  tareaPoblada.tiradas = tiradasOpt;
-  await tareaPoblada.save();
-
-  const io = req.app.get('io');
-  if (io) {
-    io.emit('task_updated', { taskId: req.params.id, tipo: 'nueva_bobina' });
-    if (req.user.rol === 'empleado') {
-      io.emit('nueva_bobina_empleado', { taskId: req.params.id, usuario: req.user.nombre, tareaNombre: tarea.titulo });
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('task_updated', { taskId: req.params.id, tipo: 'nueva_bobina' });
+      if (req.user.rol === 'empleado') {
+        io.emit('nueva_bobina_empleado', { taskId: req.params.id, usuario: req.user.nombre, tareaNombre: tarea.titulo });
+      }
     }
-  }
+    res.status(201).json({ ...bobina.toObject(), resumen });
+  } catch (err) { manejarError(res, err); }
+});
 
-  res.status(201).json(bobina);
+// Registrar una bobina que NO está en el inventario (p. ej. la pone el cliente en sitio)
+router.post('/:id/bobinas/externa', async (req, res) => {
+  let creada = null;
+  try {
+    const base = await Task.findById(req.params.id).populate('bobinas', 'nombre');
+    if (!base) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (!puedeGestionarBobinas(req.user, base)) return res.status(403).json({ error: 'No tienes permiso para registrar bobinas en esta tarea' });
+    if (base.estado === 'revisada') return res.status(400).json({ error: 'No se pueden modificar bobinas de una tarea ya revisada.' });
+
+    const nombre = String((req.body || {}).nombre || '').trim().slice(0, 80);
+    const categoria = (req.body || {}).categoria;
+    const metros = Number((req.body || {}).metrosIniciales);
+    if (!nombre) return res.status(400).json({ error: 'El nombre de la bobina es obligatorio' });
+    if (!CATEGORIAS_CABLE.includes(categoria)) return res.status(400).json({ error: 'Tipo de cable inválido' });
+    if (!(metros > 0) || metros > TOPE_METROS_BOBINA) return res.status(400).json({ error: `Los metros deben ser mayores a 0 y menores o iguales a ${TOPE_METROS_BOBINA}` });
+    if ((base.bobinas || []).some(b => b && String(b.nombre).trim().toLowerCase() === nombre.toLowerCase())) {
+      return res.status(409).json({ error: `Ya hay una bobina llamada "${nombre}" en esta tarea. Usa otro nombre.` });
+    }
+
+    creada = await Bobina.create({
+      nombre, categoria, origen: 'externa', estado: 'asignada',
+      metrosIniciales: metros, metrosRestantes: metros, metrosAlAsignar: metros,
+      tareaActual: base._id, empleadoAsignado: base.asignadoA,
+      // sin folio: las externas no llevan folio (el índice único es sparse)
+    });
+    const { tarea, resumen } = await recalcularTarea(req.params.id, (t) => { t.bobinas.push(creada); });
+
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('task_updated', { taskId: req.params.id, tipo: 'nueva_bobina' });
+      if (req.user.rol === 'empleado') {
+        io.emit('nueva_bobina_empleado', { taskId: req.params.id, usuario: req.user.nombre, tareaNombre: tarea.titulo });
+      }
+    }
+    res.status(201).json({ bobina: creada, resumen });
+  } catch (err) {
+    if (creada) await Bobina.findByIdAndDelete(creada._id).catch(() => {});   // no dejar una externa huérfana
+    manejarError(res, err);
+  }
+});
+
+// Quitar una bobina de la tarea (por error de captura). Se bloquea si ya hay cortes en ella.
+router.delete('/:id/bobinas/:bobinaId', async (req, res) => {
+  try {
+    const { bobinaId } = req.params;
+    if (!mongoose.isValidObjectId(bobinaId)) return res.status(404).json({ error: 'Bobina no encontrada' });
+    let quitada = null;
+    const { tarea, resumen } = await recalcularTarea(req.params.id, (t) => {
+      if (!puedeGestionarBobinas(req.user, t)) throw httpError(403, 'No tienes permiso para quitar bobinas de esta tarea');
+      if (t.estado === 'revisada') throw httpError(400, 'No se pueden modificar bobinas de una tarea ya revisada.');
+      quitada = t.bobinas.find(b => String(b._id) === bobinaId);
+      if (!quitada) throw httpError(404, 'Esa bobina no pertenece a la tarea');
+      const conCortes = t.tiradas.some(x => x.cortado && (String(x.bobinaId || '') === bobinaId || (!x.bobinaId && x.bobinaAsignada === quitada.nombre)));
+      if (conCortes) throw httpError(409, 'No se puede quitar la bobina: ya tiene tiradas cortadas.');
+      t.bobinas = t.bobinas.filter(b => String(b._id) !== bobinaId);
+    });
+    if (quitada.origen === 'externa') await Bobina.findByIdAndDelete(bobinaId);
+    else await Bobina.findByIdAndUpdate(bobinaId, { $set: { estado: 'disponible' }, $unset: { tareaActual: '', metrosAlAsignar: '' } });
+
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'bobina_quitada' });
+    res.json({ success: true, resumen });
+  } catch (err) { manejarError(res, err); }
+});
+
+// Recalcular manualmente ("Calcular y acomodar")
+router.post('/:id/recalcular', async (req, res) => {
+  try {
+    const { tarea, resumen } = await recalcularTarea(req.params.id, (t) => {
+      if (!esStaff(req.user) && !esAsignado(req.user, t)) throw httpError(403, 'No tienes permiso');
+      if (t.estado === 'revisada') throw httpError(400, 'No se puede recalcular una tarea ya revisada.');
+    });
+    const io = req.app.get('io');
+    if (io) io.emit('task_updated', { taskId: req.params.id, tipo: 'recalculada' });
+    res.json({ resumen, tiradas: tarea.tiradas });
+  } catch (err) { manejarError(res, err); }
 });
 
 
@@ -315,7 +411,8 @@ router.patch('/:id/tiradas/:tiradaId', async (req, res) => {
 
   // Si acaba de marcarse como cortado, descontamos de la bobina global
   if (cortado === true && !estabaCortado && tirada.bobinaAsignada && tirada.metrosReales) {
-    const bobinaGlobal = tarea.bobinas.find(b => b.nombre === tirada.bobinaAsignada);
+    const bobinaGlobal = (tirada.bobinaId && tarea.bobinas.find(b => String(b._id) === String(tirada.bobinaId)))
+      || tarea.bobinas.find(b => b.nombre === tirada.bobinaAsignada);
     if (bobinaGlobal) {
       bobinaGlobal.metrosRestantes -= tirada.metrosReales;
       if (bobinaGlobal.metrosRestantes <= 0) {
@@ -343,11 +440,12 @@ router.post('/:id/finalize', async (req, res) => {
   const tarea = await Task.findById(req.params.id);
   if (!tarea) return res.status(404).json({ error: 'Tarea no encontrada' });
 
+  const origenes = await origenPorBobina(tarea.bobinas);
   for (const bobinaId of tarea.bobinas) {
     const decision = (decisiones || {})[bobinaId];
-    const b0 = await Bobina.findById(bobinaId).select('tareaActual');
-    if (decision && b0 && String(b0.tareaActual) === String(tarea._id)) {
-      const nuevoEstado = decision === 'regresar' ? 'disponible' : 'desecho';
+    if (decision) {
+      // Externas (del cliente): regresar = devolver al cliente. NUNCA pasan a disponible.
+      const nuevoEstado = destinoBobina(origenes[bobinaId], decision === 'regresar');
       await Bobina.findByIdAndUpdate(bobinaId, { 
         estado: nuevoEstado, 
         tareaActual: null 
@@ -390,8 +488,9 @@ router.post('/employee-quick-task', async (req, res) => {
       });
     }
 
-    // Correr optimizador con las bobinas y tiradas del empleado
-    const { tiradas: tiradasOpt } = optimizarCortes(bobinasCompletas, tiradas || []);
+    // Correr optimizador con las bobinas y tiradas del empleado (base = metros que tiene cada bobina hoy)
+    const paraCalculo = bobinasCompletas.map(b => ({ _id: b._id, nombre: b.nombre, categoria: b.categoria, metrosIniciales: b.metrosIniciales, metrosAlAsignar: b.metrosRestantes }));
+    const { tiradas: tiradasOpt } = optimizarCortes(paraCalculo, tiradas || []);
 
     const task = await Task.create({
       titulo,
@@ -409,10 +508,9 @@ router.post('/employee-quick-task', async (req, res) => {
 
     // Ligar las bobinas a esta nueva tarea para que no se reutilicen
     if (bobinasCompletas.length > 0) {
-      await Bobina.updateMany(
-        { _id: { $in: bobinasCompletas.map(b => b._id) } },
-        { $set: { tareaActual: task._id } }
-      );
+      await Bobina.bulkWrite(bobinasCompletas.map(b => ({
+        updateOne: { filter: { _id: b._id }, update: { $set: { tareaActual: task._id, metrosAlAsignar: b.metrosRestantes } } }
+      })));
     }
 
     const io = req.app.get('io');
@@ -451,9 +549,10 @@ router.post('/:id/employee-finalize', async (req, res) => {
     }
 
     // Aplicar decisiones sobre las bobinas (regresar al almacén o desechar)
+    const origenes = await origenPorBobina(tarea.bobinas);
     for (const bobinaId of tarea.bobinas) {
       const decision = decisiones ? decisiones[bobinaId] : 'regresar';
-      const nuevoEstado = decision === 'desecho' ? 'desecho' : 'disponible';
+      const nuevoEstado = destinoBobina(origenes[bobinaId], decision !== 'desecho');
       await Bobina.findByIdAndUpdate(bobinaId, {
         estado: nuevoEstado,
         tareaActual: null,
@@ -485,81 +584,6 @@ router.post('/:id/employee-finalize', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-
-// ── Iniciar tarea (empleado / admin) ──
-router.post('/:id/start', async (req, res) => {
-  try {
-    const t = await Task.findById(req.params.id).select('estado startedAt');
-    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
-    if (t.estado === 'pendiente') {
-      t.estado = 'en_progreso'; if (!t.startedAt) t.startedAt = new Date(); await t.save();
-    }
-    const io = req.app.get('io');
-    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'cambio_estado', estado: t.estado });
-    res.json({ ok: true, estado: t.estado });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// ── Avance parcial: guarda reporte SIN enviar a revisión ──
-router.post('/:id/avance', async (req, res) => {
-  try {
-    const { comentario, fotos } = req.body || {};
-    if (!comentario || !String(comentario).trim()) return res.status(400).json({ error: 'El comentario es obligatorio' });
-    const t = await Task.findById(req.params.id).select('titulo estado startedAt');
-    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
-    if (t.estado === 'revisada') return res.status(400).json({ error: 'La tarea ya fue aprobada' });
-    await Report.create({ tarea: t._id, autor: req.user.id, comentario: String(comentario).trim(), fotos: fotos || [] });
-    const upd = {};
-    if (t.estado === 'pendiente') upd.estado = 'en_progreso';
-    if (t.estado === 'requiere_evidencia') upd.estado = 'enviada'; // ya respondió a la solicitud del admin
-    if (!t.startedAt) upd.startedAt = new Date();
-    if (Object.keys(upd).length) await Task.findByIdAndUpdate(t._id, upd);
-    const io = req.app.get('io');
-    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'nuevo_reporte' });
-    avisarAdmins('Nuevo avance', `${req.user.nombre || 'El técnico'} registró un avance en: ${t.titulo}`, t._id);
-    res.status(201).json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// ── Terminar y enviar a revisión ──
-router.post('/:id/enviar-revision', async (req, res) => {
-  try {
-    const t = await Task.findById(req.params.id).select('titulo estado');
-    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
-    if (!['pendiente', 'en_progreso', 'requiere_evidencia'].includes(t.estado)) return res.status(400).json({ error: 'La tarea no se puede enviar en su estado actual' });
-    t.estado = 'enviada'; await t.save();
-    const io = req.app.get('io');
-    if (io) io.emit('task_updated', { taskId: String(t._id), tipo: 'cambio_estado', estado: 'enviada' });
-    avisarAdmins('Tarea lista para revisar', `${req.user.nombre || 'El técnico'} envió a revisión: ${t.titulo}`, t._id);
-    res.json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// ── Solicitar material / avisar que falta cable ──
-router.post('/:id/solicitar-material', async (req, res) => {
-  try {
-    const mensaje = String((req.body || {}).mensaje || '').trim().slice(0, 500);
-    if (!mensaje) return res.status(400).json({ error: 'Escribe qué material necesitas' });
-    const t = await Task.findById(req.params.id).select('titulo');
-    if (!t) return res.status(404).json({ error: 'Tarea no encontrada' });
-    await Report.create({ tarea: t._id, autor: req.user.id, comentario: `📦 Solicitud de material: ${mensaje}` });
-    const io = req.app.get('io');
-    if (io) io.emit('solicitud_material', { taskId: String(t._id), usuario: req.user.nombre, tareaNombre: t.titulo, mensaje });
-    avisarAdmins('📦 Solicitud de material', `${req.user.nombre || 'El técnico'} (${t.titulo}): ${mensaje}`, t._id);
-    res.status(201).json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// ── Empleado devuelve al almacén una bobina que tiene asignada sin tarea ──
-router.post('/mis-bobinas/:bid/devolver', async (req, res) => {
-  try {
-    const b = await Bobina.findOneAndUpdate(
-      { _id: req.params.bid, empleadoAsignado: req.user.id, estado: 'asignada', tareaActual: null },
-      { estado: 'disponible', empleadoAsignado: null }, { new: true });
-    if (!b) return res.status(404).json({ error: 'Bobina no encontrada o ya está en uso' });
-    res.json(b);
-  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 module.exports = router;
