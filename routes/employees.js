@@ -507,17 +507,42 @@ router.patch('/:userId/equipo/:equipmentId', async (req, res) => {
   try {
     const user = await findCRMUser(req.params.userId, { _id: 1 }, req.query.idType);
     if (!user) return res.status(404).json({ error: 'Empleado no encontrado.' });
-    const estado = String(req.body?.estado || '');
-    if (!['Asignado', 'Devuelto', 'Faltante', 'Baja'].includes(estado)) return res.status(400).json({ error: 'Estado de equipo no válido.' });
-    const set = { estado };
-    if (estado === 'Devuelto') set.fechaDevolucion = new Date();
-    if (estado === 'Asignado') set.fechaDevolucion = null;
-    const equipment = await EmployeeEquipment.findOneAndUpdate({ _id: req.params.equipmentId, usuarioId: String(user._id) }, { $set: set }, { new: true });
+    // Acepta el estado y/o los datos del equipo (tipo, nombre, serie, notas); solo se cambia lo que llega.
+    const body = req.body || {};
+    const set = {};
+    if (body.estado !== undefined) {
+      const estado = String(body.estado);
+      if (!['Asignado', 'Devuelto', 'Faltante', 'Baja'].includes(estado)) return res.status(400).json({ error: 'Estado de equipo no válido.' });
+      set.estado = estado;
+      if (estado === 'Devuelto') set.fechaDevolucion = new Date();
+      if (estado === 'Asignado') set.fechaDevolucion = null;
+    }
+    if (body.tipo !== undefined) {
+      const tipo = String(body.tipo);
+      if (!['Herramienta', 'Equipo personal'].includes(tipo)) return res.status(400).json({ error: 'Tipo de equipo no válido.' });
+      set.tipo = tipo;
+    }
+    if (body.nombre !== undefined) {
+      const nombre = String(body.nombre).trim().slice(0, 120);
+      if (!nombre) return res.status(400).json({ error: 'El nombre del equipo es obligatorio.' });
+      set.nombre = nombre;
+    }
+    if (body.numeroSerie !== undefined) set.numeroSerie = String(body.numeroSerie).trim().slice(0, 120);
+    if (body.notas !== undefined) set.notas = String(body.notas).trim().slice(0, 1000);
+    if (!Object.keys(set).length) return res.status(400).json({ error: 'No hay cambios que guardar.' });
+
+    const filter = { _id: req.params.equipmentId, usuarioId: String(user._id) };
+    const before = await EmployeeEquipment.findOne(filter).lean();
+    if (!before) return res.status(404).json({ error: 'Equipo no encontrado.' });
+    const equipment = await EmployeeEquipment.findOneAndUpdate(filter, { $set: set }, { new: true, runValidators: true });
     if (!equipment) return res.status(404).json({ error: 'Equipo no encontrado.' });
-    await audit(req, user._id, 'equipo.estado_actualizado', `${equipment.nombre}: ${estado}`, { equipoId: String(equipment._id) });
+
+    if (set.estado !== undefined) await audit(req, user._id, 'equipo.estado_actualizado', `${equipment.nombre}: ${set.estado}`, { equipoId: String(equipment._id) });
+    const editados = ['tipo', 'nombre', 'numeroSerie', 'notas'].filter(key => set[key] !== undefined && String(before[key] || '') !== String(equipment[key] || ''));
+    if (editados.length) await audit(req, user._id, 'equipo.editado', `${equipment.nombre}: ${editados.join(', ')}`, { equipoId: String(equipment._id), campos: editados });
     res.json(equipment);
   } catch (error) {
-    res.status(400).json({ error: 'No se pudo actualizar el estado del equipo.' });
+    res.status(400).json({ error: 'No se pudo actualizar el equipo.' });
   }
 });
 
